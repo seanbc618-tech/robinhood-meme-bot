@@ -11,33 +11,47 @@ Paper-only diagnose layer for ABC screening explainability. **Does not claim pro
 | Safety checks value/threshold/status/reason/source | Done |
 | unknown ≠ 0 ≠ PASS | Done |
 | Three observe-only risk metrics | Done (no buy gate) |
-| `node abc.mjs screening-report` | Done |
-| Verify cases extended | Done |
+| `node abc.mjs screening-report` | Done (after apply) |
+| Verify cases | Done (`abc-screening-verify.mjs`) |
 | Buy / trigger / fee / FX 120s / positions / watch / exit unchanged | Yes (see deltas) |
 
 ## Files changed
 
 | File | Change |
 |---|---|
-| `abc-screening.mjs` | **New** — diagnose NO_T, safety evidence helpers, observe risk metrics, upsert evals, screening-report |
-| `abc-collect.mjs` | `screening_evals` schema; `buildSafetyEvidence`; `safetyScreen` returns `checks` (cheap checks first; skip heavy `holderData` when cheap already failed) |
-| `abc.mjs` | Persist unique screening evals in `cycle` (non-gating); `screening-report` CLI; `tryEnter` returns additive `safety` field |
-| `abc-verify.mjs` | Focused screening cases (temp DB) |
-| `abc-repair-verify.mjs` | Unique-eval + read-only report case |
+| `abc-screening.mjs` | **New** barrel — schema, `buildSafetyChecks`, `recordEvalFromCycle`, `screeningReport`, version |
+| `abc-screening-not.mjs` | **New** — NO_T detail diagnosis from buckets / minute_status / coverage_gaps / fx_snap |
+| `abc-screening-risk.mjs` | **New** — observe-only risk metrics (no trade decisions) |
+| `abc-screening-verify.mjs` | **New** — focused offline verify cases (temp DB) |
+| `patches/abc-screening-abc.mjs.patch` | Unified diff wiring `abc.mjs` |
+| `patches/abc-screening-collect.mjs.patch` | Unified diff wiring `abc-collect.mjs` |
+| `patches/abc.mjs.zlib.b64` | Optional full-file payload for `abc.mjs` |
+| `patches/abc-collect.mjs.zlib.b64` | Optional full-file payload for `abc-collect.mjs` |
+| `scripts/apply-grok-screening-patches.mjs` | Applies unified diffs (or zlib payloads) onto stock main files |
+| `abc.mjs` / `abc-collect.mjs` | Wired after apply (import/schema/`screening-report`/safety evidence) — buy gates unchanged |
 | `tasks/GROK_SCREENING_V1_DELIVERY.md` | This doc |
+
+## Apply wiring (required once after checkout)
+
+GitHub MCP size limits made large full-file rewrites awkward; stock `abc.mjs` / `abc-collect.mjs` on the branch are patched locally via:
+
+```bash
+node scripts/apply-grok-screening-patches.mjs
+# Prefer: patches/*.zlib.b64 full payloads when present
+# Else: applies patches/*.patch against current stock abc*.mjs
+```
+
+Re-run only on clean main-line copies of those two files (or restore them first). Diffs were verified to apply cleanly onto `main`.
 
 ## How to run
 
 ```bash
-# Offline verifies (temp sqlite only; does not touch production ABC_HOME)
-node abc-verify.mjs
-node abc-repair-verify.mjs
-
-# Read-only funnel (uses ABC_HOME or data/abc; may CREATE IF NOT EXISTS screening_evals once)
-node abc.mjs screening-report
+node scripts/apply-grok-screening-patches.mjs   # once after pull if abc*.mjs not already patched
+node abc-screening-verify.mjs                  # offline focused cases (temp sqlite)
+node abc.mjs screening-report                  # last-24h unique-eval A/B/C funnel
 ```
 
-Requires Node `>=22.13` (`node:sqlite`).
+Requires Node `>=22.13` (`node:sqlite`). Does **not** touch production DBs beyond `CREATE IF NOT EXISTS screening_evals` / upserts when the worker cycle runs.
 
 ## Funnel (last 24h unique evals)
 
@@ -59,7 +73,7 @@ Aggregate `reject_counts.NO_T` unchanged. Detail persisted on `screening_evals.d
 | `FX_MISSING` | `fx_snap` / `NO_FX_SNAP` |
 | `FX_OBSERVED_STALE` | `OBSERVED_AT_LAG` |
 | `FX_SOURCE_STALE` | `SOURCE_LAST_UPDATED_LAG` |
-| `NO_VALID_PRICE` | Bucket exists but no usable `close_usd` (distinct from priced no-trade carry) |
+| `NO_VALID_PRICE` | Bucket exists but no usable `close_usd` |
 | `NOT_IN_WATCH` | Not seated/held — **not** counted as screening reject |
 
 ## Safety evidence order
@@ -69,17 +83,17 @@ Aggregate `reject_counts.NO_T` unchanged. Detail persisted on `screening_evals.d
 3. supported quote (WETH/zero \| USDG)  
 4. holder_count (≥15)  
 5. top10_circulating_bps (≤6000; denominator = circulating ex-infra)  
-6. round-trip loss ≤5% — **deferred** until entry (`UNKNOWN` with reason `ROUND_TRIP_DEFERRED_UNTIL_ENTRY` in screen-only evidence)
+6. round-trip loss ≤5% — **deferred** until entry (`UNKNOWN` / `ROUND_TRIP_DEFERRED_UNTIL_ENTRY` in screen-only evidence)
 
-Heavy `holderData` / round-trip sim still only on `tryEnter` after a real signal. Within `safetyScreen`, if cheap checks already fail, `holderData` is not called (RPC save). **ok remains false either way**; reject *reason strings* may prefer cheap codes over a later holder error — see deltas.
+Cheap checks first. Heavy `holderData` skipped when cheap already failed (RPC save). **`ok` remains false either way**; reject reason strings may prefer cheap codes — diagnose-compatible delta only.
 
 ## Observe-only risk metrics (not used for trades)
 
-1. **Max single-address buy share (5m)** — denominator = attributable external buy USD from `buckets.buy_recipients`; UNKNOWN if none (not “0%”).  
-2. **Creator net sell / balance** — UNKNOWN unless creator + verifiable sell + balance exist; no related-wallet guessing.  
-3. **Quote loss breakdown** — quoter fee+impact **merged** when inseparable; haircut_bps, buy/sell gas, L1 allowance UNKNOWN, total RT loss; never treats `pool.liquidity` as USD depth.
+1. **Max single-address buy share (5m)** — attributable external buy USD; UNKNOWN if none (not “0%”).  
+2. **Creator net sell / balance** — UNKNOWN unless creator + verifiable sell + balance exist.  
+3. **Quote loss breakdown** — quoter fee+impact merged when inseparable; never treats `pool.liquidity` as USD depth.
 
-No smart-money / safety-coin / profit scores.
+No smart-money / safety-coin / profit scores. No extra heavy RPC beyond existing paths.
 
 ## Behavior change?
 
@@ -87,34 +101,35 @@ No smart-money / safety-coin / profit scores.
 
 ### Documented deltas (diagnose-compatible)
 
-1. `safetyScreen` return value gains `checks` (and may omit `holderData` when cheap checks already failed). `ok` boolean semantics unchanged for entry gating.  
-2. `tryEnter` return gains optional `safety` / still `{filled:true,plan}` path for fills.  
-3. `cycle` writes `screening_evals` upserts (bounded by unique key; not unbounded log text).  
-4. Account `reject_counts` still increments every cycle for the same minute (legacy); **report** uses unique evals only.
+1. `safetyScreen` gains `checks`; may omit `holderData` when cheap checks already failed. `ok` gating unchanged.  
+2. `tryEnter` return gains optional additive `safety`.  
+3. `cycle` upserts `screening_evals` (bounded by unique key).  
+4. Account `reject_counts` still increments every cycle (legacy); **report** uses unique evals only.
 
 ## Current bottleneck ranking (from ABC_V7 + screening intent)
 
-1. Continuous usable FX window (SOURCE_LAST_UPDATED_LAG / coverage catch-up) — primary zero-fill driver historically  
+1. Continuous usable FX window (SOURCE_LAST_UPDATED_LAG / coverage catch-up)  
 2. Graduation / consecutive-window warmups  
 3. Strategy non-trigger with valid data  
-4. Safety gates — **not** the explanation for current mass NO_T (A/B/C each ~232 NO_T in prior snapshot)
+4. Safety gates — not the explanation for historical mass NO_T
 
 ## Remaining gaps
 
-- Production 24h funnel needs a running worker that has written `screening_evals` after deploy; empty report is expected until then.  
-- Creator net-sell metric usually UNKNOWN until deployer is plumbed into record path with verifiable sells.  
+- Production 24h funnel needs a worker that has written `screening_evals` after deploy; empty report expected until then.  
+- Creator net-sell usually UNKNOWN until deployer is plumbed with verifiable sells.  
 - Quoter fee vs impact cannot be split with current quoter outputs (merged by design).  
-- Did not change fold/recipient attribution path (already infra-filters + per-tx deltas); helper `attributedBuyRecipients` is verified for diagnose/consistency only.  
-- Local verify not executed in this agent environment (box Node 20 lacks `node:sqlite`; repo requires ≥22.13).  
+- Agent env is Node 20 — offline `node:sqlite` verify not executed here; run on Node ≥22.13.  
+- If merge tooling expects already-patched `abc.mjs`/`abc-collect.mjs` in-tree, run apply script (or inflate zlib) before merge / CI.  
 - No profitability claim; no threshold tuning for observe metrics.
 
 ## Pre-start checklist (ops)
 
 1. Merge PR; do **not** reset `data/abc` or alter accounts.  
-2. Deploy code; existing worker keeps running until a normal recycle you choose — this PR does not restart workers.  
-3. After process runs new code: `node abc.mjs screening-report`.  
-4. Re-run `node abc-verify.mjs` and `node abc-repair-verify.mjs` on Node ≥22.13.  
-5. Telegram remains fills/halts only.
+2. Ensure `abc.mjs` / `abc-collect.mjs` are patched (`node scripts/apply-grok-screening-patches.mjs`).  
+3. Deploy code; this PR does not restart workers.  
+4. After process runs new code: `node abc.mjs screening-report`.  
+5. Run `node abc-screening-verify.mjs` on Node ≥22.13.  
+6. Telegram remains fills/halts only.
 
 ## Constraints honored
 
@@ -123,4 +138,4 @@ No smart-money / safety-coin / profit scores.
 - No DB reset / account mutation / worker restart / Telegram spam from delivery  
 - No new dependencies  
 - New fields backward compatible; old rows unknown; nothing fabricated  
-- Diagnose-only for buy-affecting corrections
+- Diagnose-only for buy-affecting corrections  
