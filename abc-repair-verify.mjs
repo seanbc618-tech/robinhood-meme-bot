@@ -6,7 +6,7 @@ import {
   openAbc,initAccounts,readAccount,writeAccount,writeRun,readRun,
   minutesToClose,minuteStart,classifyError,plannedRoundTripFromQuotes,
   collectBuckets,netExitValue,HAIRCUT_BPS,STRATEGY_VERSION,loadBuckets,
-  foldStoredEvents,fxContemporaneous,skipBacklogForLive,saveFxSnap,ensureWatchSlots,logBlocksNeeded,
+  foldStoredEvents,fxContemporaneous,fxForMinute,skipBacklogForLive,saveFxSnap,ensureWatchSlots,logBlocksNeeded,
   watchSlotDecision,WATCH_MAX_MS,WATCH_POST_MATURITY_MS,rpcRetry,RPC_CALL_TIMEOUT_MS,
 } from './abc-collect.mjs';
 import {
@@ -17,6 +17,35 @@ import {
 const fails=[];
 function assert(name,ok,detail){if(ok) console.log('PASS',name); else {console.log('FAIL',name,detail||'');fails.push(name);}}
 function tmp(){return mkdtempSync(join(tmpdir(),'abc-repair-'));}
+
+{
+  const dir=tmp();
+  try {
+    const store=openAbc(dir);
+    const rates=(observed,eth,usdg)=>({observed_at:observed,prices:{
+      ethereum:{usd:2000,last_updated_at:eth},'global-dollar':{usd:1,last_updated_at:usdg},tether:{usd:1,last_updated_at:observed}}});
+    saveFxSnap(store,rates(1200,1200,900));
+    saveFxSnap(store,rates(1260,900,1260));
+    assert('later stale ETH observation cannot erase valid snapshot',fxForMinute(store,1200,zeroAddress).rates?.observed_at===1200);
+    assert('USDG selects its own valid observation',fxForMinute(store,1200,'0x123').rates?.observed_at===1260);
+    saveFxSnap(store,rates(1320,900,900));
+    assert('stale source remains rejected',fxForMinute(store,1320,zeroAddress).reason==='SOURCE_LAST_UPDATED_LAG');
+    const now=1700000000000;
+    const ins=store.db.prepare(`INSERT INTO pools(token,pool_id,quote,first_seen_block,first_seen_ts,last_cursor_block,quote_status,registered_ts) VALUES(?,?,?,?,?,?,?,?)`);
+    ins.run('old','0x',zeroAddress,1,1,1,'ok',now/1000-25*3600);
+    store.db.prepare(`INSERT INTO watch_slots VALUES(1,'old',?,?,'ACTIVE')`).run(now-3600000,now+WATCH_MAX_MS);
+    ins.run('young','0x',zeroAddress,1,2,1,'ok',now/1000-3600);
+    const slots=ensureWatchSlots(store,now);
+    assert('existing B history retained while young C gets separate slot',slots.live.find(x=>x._slot===1)?.token==='old'&&slots.live.find(x=>x._slot===2)?.token==='young');
+    assert('C rotates at age six hours',!watchSlotDecision(store,store.db.prepare('SELECT * FROM watch_slots WHERE slot=2').get(),now+5*3600000).keep);
+    const later=ensureWatchSlots(store,now+5*3600000);
+    assert('C slot stays empty without eligible pool',!later.live.some(x=>x._slot===2));
+    store.close();
+    const reopened=openAbc(dir);
+    assert('FX evidence survives restart',fxForMinute(reopened,1200,zeroAddress).ok);
+    reopened.close();
+  } finally {rmSync(dir,{recursive:true,force:true});}
+}
 
 {
   const t0=Date.parse('2026-01-01T12:00:20Z')/1000;
@@ -421,6 +450,7 @@ assert('strategy version is v7',STRATEGY_VERSION==='abc-phase1-v7');
       store.db.prepare(`INSERT INTO pools(token,pool_id,quote,first_seen_block,first_seen_ts,last_cursor_block,quote_status,decimals,quote_decimals)
         VALUES(?,?,?,?,?,?,?,?,?)`).run(tok,'0x',zeroAddress,1,1,1,'ok',18,18);
     }
+    store.db.prepare('UPDATE pools SET registered_ts=?').run(Math.floor(Date.now()/1000)-3600);
     let collects=0;
     const io={
       skipCatalog:true,skipLiveJump:true,gasPrice:1n,collectBudgetMs:25,liveWatchN:3,

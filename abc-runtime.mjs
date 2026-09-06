@@ -57,9 +57,13 @@ export async function notifyHourlyHoldings(store,run) {
   const hour=new Date().toISOString().slice(0,13);
   if(run.last_holdings_hour===hour) return;
   const accs=['A','B','C'].map(s=>readAccount(store,s));
-  const latest=store.db.prepare(`SELECT MAX(minute) AS minute FROM buckets WHERE invalid=0 AND usd_usable=1 AND token IN (SELECT token FROM watch_slots WHERE status='ACTIVE')`).get();
-  const lag=latest.minute==null?'无可用行情':`${Math.max(0,Math.floor((Date.now()/1000-latest.minute-60)/60))} 分钟`;
-  const counts=store.db.prepare(`SELECT strategy,COUNT(*) AS n FROM screening_evals WHERE observed_at>=? AND funnel_stage IN ('NO_STRATEGY_SIGNAL','STRATEGY_SIGNAL','SAFETY_PASS','SAFETY_FAIL','PAPER_FILL') GROUP BY strategy`).all(Date.now()-3600000);
+  const latest=store.db.prepare(`SELECT w.slot,MAX(b.minute) AS minute FROM watch_slots w
+    LEFT JOIN buckets b ON b.token=w.token AND b.invalid=0 AND b.usd_usable=1
+    WHERE w.status='ACTIVE' GROUP BY w.slot ORDER BY w.slot`).all();
+  const lag=latest.map(x=>`槽${x.slot}：${x.minute==null?'无可用行情':`${Math.max(0,Math.floor((Date.now()/1000-x.minute-60)/60))} 分钟`}`).join('；')||'无观察池';
+  const counts=store.db.prepare(`SELECT strategy,COUNT(*) AS n FROM screening_evals WHERE observed_at>=?
+    AND COALESCE(detail_code,'')!='GRADUATION_OVER6H'
+    AND funnel_stage IN ('NO_STRATEGY_SIGNAL','STRATEGY_SIGNAL','SAFETY_PASS','SAFETY_FAIL','PAPER_FILL') GROUP BY strategy`).all(Date.now()-3600000);
   const effective=['A','B','C'].map(s=>`${s}:${counts.find(x=>x.strategy===s)?.n||0}`).join('，');
   const result=await notifySafe(run,`hourly-holdings:${run.started_at}:${hour}`,
     `📊 ABC 每小时持仓（纸面模拟，非实盘）\n报告时间：${new Date().toISOString()}\n状态：${run.status}\n行情落后：${lag}\n最近60分钟有效评估：${effective}\n最近完成轮：${run.last_completed_at?new Date(run.last_completed_at).toISOString():'尚无'}\n${accs.map(accountSummary).join('\n\n')}`);
@@ -119,7 +123,8 @@ export async function cycle(store,now=Date.now(),io={}) {
   const ending=now>=run.ends_at||existsSync(resolve(store.dir,'stop.json'));
   const watch=pickLiveWatch(store,held,io.liveWatchN??LIVE_WATCH_N);
   run.live_watch={n:watch.n,catalog_ok:watch.catalog_ok,tokens:watch.live.map(r=>r.token),note:watch.note};
-  const queue=watch.live;
+  // Alternate the first unheld slot so catch-up cannot monopolize the shared budget.
+  const queue=(run.rounds||0)%2?[...watch.live].reverse():watch.live;
   const analyzed=[];
   const warmup={A:0,B:0,C:0};
   const signals=[];

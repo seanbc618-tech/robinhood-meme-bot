@@ -12,7 +12,7 @@ export const CODE_VERSION='abc-phase1-v7';
 export const STALE_SEC=120;
 export const CYCLE_TARGET_MS=60000;
 export const ANALYZE_LIMIT=1;
-export const LIVE_WATCH_N=1;
+export const LIVE_WATCH_N=2;
 export const WATCH_TTL_MS=24*3600*1000;
 export const WATCH_POST_MATURITY_MS=2*3600*1000;
 export const WATCH_MAX_MS=36*3600*1000;
@@ -183,6 +183,11 @@ export function openAbc(home) {
       minute INTEGER PRIMARY KEY, observed_at INTEGER NOT NULL,
       eth_usd REAL, usdg_usd REAL, tether_usd REAL,
       eth_last_updated INTEGER, usdg_last_updated INTEGER, tether_last_updated INTEGER);
+    CREATE TABLE IF NOT EXISTS fx_observations(
+      minute INTEGER NOT NULL, observed_at INTEGER NOT NULL,
+      eth_usd REAL, usdg_usd REAL, tether_usd REAL,
+      eth_last_updated INTEGER, usdg_last_updated INTEGER, tether_last_updated INTEGER,
+      PRIMARY KEY(minute,observed_at));
     CREATE TABLE IF NOT EXISTS minute_status(
       token TEXT NOT NULL, minute INTEGER NOT NULL, reason TEXT NOT NULL, at INTEGER NOT NULL,
       PRIMARY KEY(token, minute));`);
@@ -258,7 +263,7 @@ export function saveFxSnap(store,rates) {
     eth_last_updated:p.ethereum?.last_updated_at,usdg_last_updated:p['global-dollar']?.last_updated_at,
     tether_last_updated:p.tether?.last_updated_at,
   };
-  const ins=store.db.prepare(`INSERT OR REPLACE INTO fx_snap(minute,observed_at,eth_usd,usdg_usd,tether_usd,eth_last_updated,usdg_last_updated,tether_last_updated)
+  const ins=store.db.prepare(`INSERT OR IGNORE INTO fx_observations(minute,observed_at,eth_usd,usdg_usd,tether_usd,eth_last_updated,usdg_last_updated,tether_last_updated)
     VALUES(?,?,?,?,?,?,?,?)`);
   const m=minuteStart(rates.observed_at);
   ins.run(m,row.observed_at,row.eth_usd,row.usdg_usd,row.tether_usd,row.eth_last_updated,row.usdg_last_updated,row.tether_last_updated);
@@ -266,11 +271,17 @@ export function saveFxSnap(store,rates) {
 }
 
 export function fxForMinute(store,minute,quote) {
-  const snap=store.db.prepare('SELECT * FROM fx_snap WHERE minute=?').get(minute);
   const end=Number(minute)+60;
+  const eth=quote==null||quote===zeroAddress||String(quote).toLowerCase()===zeroAddress;
+  // Preserve legacy evidence; choose independently for each quote asset.
+  const candidates=store.db.prepare(`SELECT * FROM fx_observations WHERE minute=?
+    UNION ALL SELECT * FROM fx_snap WHERE minute=? ORDER BY observed_at DESC`).all(minute,minute);
+  const snap=candidates.find(s=>Math.abs(Number(s.observed_at)-end)<=STALE_SEC
+    && (eth?s.eth_last_updated:s.usdg_last_updated)!=null
+    && Math.abs(Number(eth?s.eth_last_updated:s.usdg_last_updated)-end)<=STALE_SEC
+    && (eth?s.eth_usd:s.usdg_usd)>0)||candidates[0];
   if(!snap) return {ok:false,reason:'NO_FX_SNAP'};
   if(Math.abs(Number(snap.observed_at)-end)>STALE_SEC) return {ok:false,reason:'OBSERVED_AT_LAG'};
-  const eth=quote==null||quote===zeroAddress||String(quote).toLowerCase()===zeroAddress;
   const lu=eth?snap.eth_last_updated:snap.usdg_last_updated;
   const px=eth?snap.eth_usd:snap.usdg_usd;
   if(lu==null||Math.abs(Number(lu)-end)>STALE_SEC) return {ok:false,reason:'SOURCE_LAST_UPDATED_LAG'};
@@ -299,7 +310,7 @@ export function logBlocksNeeded(store,intervalSec=60) {
 
 export function extendActiveWatchBounds(store) {
   store.db.prepare(`UPDATE watch_slots SET expires_at=seated_at+?, status=COALESCE(status,'ACTIVE')
-    WHERE COALESCE(status,'ACTIVE')='ACTIVE' AND expires_at<seated_at+?`).run(WATCH_MAX_MS,WATCH_MAX_MS);
+    WHERE slot!=2 AND COALESCE(status,'ACTIVE')='ACTIVE' AND expires_at<seated_at+?`).run(WATCH_MAX_MS,WATCH_MAX_MS);
 }
 
 export function usableStreak(store,token) {
@@ -317,6 +328,10 @@ export function watchSlotDecision(store,slot,now=Date.now()) {
   const streak=usableStreak(store,slot.token);
   const pool=store.db.prepare('SELECT * FROM pools WHERE token=?').get(slot.token);
   const grad=pool?graduationTs(pool):null;
+  if(slot.slot===2) {
+    const keep=grad!=null&&now<Number(grad)*1000+6*3600000;
+    return {keep,reason:keep?null:'WATCH_C_AGE_EXPIRED',streak,maxEnd};
+  }
   const gradMs=grad!=null?Number(grad)*1000:Number(slot.seated_at);
   const holdUntil=gradMs+24*3600*1000+WATCH_POST_MATURITY_MS;
   if(now>=maxEnd) return {keep:false,reason:streak.longest>=WATCH_WINDOW_MINUTES?'WATCH_EXPIRED_MAX_BOUND':'WATCH_EXPIRED_INCOMPLETE_WINDOW',streak,holdUntil,maxEnd};
@@ -359,7 +374,13 @@ export function ensureWatchSlots(store,now=Date.now(),n=LIVE_WATCH_N) {
     for(const row of pickFrom) {
       if(keep.length>=n) break;
       if(seated.has(row.token.toLowerCase())) continue;
-      const exp=now+WATCH_MAX_MS;
+      const existing=new Set(store.db.prepare('SELECT slot FROM watch_slots').all().map(s=>s.slot));
+      let target=ri<reusable.length?reusable[ri].slot:1;
+      if(ri>=reusable.length) while(existing.has(target)) target++;
+      const grad=graduationTs(row);
+      // Slot 1 retains A/B history; slot 2 admits pools with time to build C's 30m window.
+      if(target===2&&(grad==null||now<grad*1000||now>=grad*1000+5.5*3600000)) continue;
+      const exp=target===2?grad*1000+6*3600000:now+WATCH_MAX_MS;
       if(ri<reusable.length) {
         const old=reusable[ri++];
         store.db.exec('BEGIN');
@@ -385,7 +406,7 @@ export function ensureWatchSlots(store,now=Date.now(),n=LIVE_WATCH_N) {
     live:rows,
     n,
     catalog_ok:store.db.prepare(`SELECT count(*) c FROM pools WHERE quote_status='ok'`).get().c,
-    note:`FIXED_WATCH n=${n} max=${WATCH_MAX_MS/3600000}h; keep after grad+24h for +2h and until ${WATCH_WINDOW_MINUTES}m usable window or fail; not full catalog`,
+    note:`WATCH n=${n}; slot 1 retains A/B up to ${WATCH_MAX_MS/3600000}h; slot 2 C age <6h; empty if no eligible pool; not full catalog`,
   };
 }
 
