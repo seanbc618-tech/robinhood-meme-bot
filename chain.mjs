@@ -36,9 +36,32 @@ export const A = {
 const readTransport = http(
   process.env.ROBINHOOD_RPC_URL || 'https://rpc.mainnet.chain.robinhood.com',
   { retryCount: 0, timeout: 20000, fetchOptions: { headers: { 'User-Agent': 'rh-dog-bot/0.2' } } })({});
-const logTransport=http('https://rpc.mainnet.chain.robinhood.com',{retryCount:0,timeout:20000})({});
+const logTransport=http('https://rpc.mainnet.chain.robinhood.com',{retryCount:0,timeout:4000})({});
+const backupLogTransport=process.env.ROBINHOOD_TRACE_RPC_URL
+  ?http(process.env.ROBINHOOD_TRACE_RPC_URL,{retryCount:0,timeout:4000})({}):null;
+let backupLogsUntil=0;
+export const logRpcHealth={public_failures:0,backup_successes:0,last_failure:null};
+async function logRequest(args) {
+  const backup=backupLogTransport&&Date.now()<backupLogsUntil;
+  try {
+    const result=await (backup?backupLogTransport:logTransport).request(args);
+    if(backup) logRpcHealth.backup_successes++;
+    return result;
+  } catch(error) {
+    const p=args.params?.[0]||{};
+    logRpcHealth.last_failure={provider:backup?'solid':'public',method:args.method,
+      from:p.fromBlock,to:p.toBlock,address:p.address,at:Date.now(),
+      code:error.code??error.cause?.code??null};
+    if(!backup) logRpcHealth.public_failures++;
+    if(!backupLogTransport||backup) throw error;
+    backupLogsUntil=Date.now()+300000;
+    const result=await backupLogTransport.request(args);
+    logRpcHealth.backup_successes++;
+    return result;
+  }
+}
 export const client=createPublicClient({transport:custom({request:args=>
-  (args.method==='eth_getLogs'?logTransport:readTransport).request(args)}, {retryCount:0})});
+  args.method==='eth_getLogs'?logRequest(args):readTransport.request(args)}, {retryCount:0})});
 export const traceClient=createPublicClient({transport:http(
   process.env.ROBINHOOD_TRACE_RPC_URL || process.env.ROBINHOOD_RPC_URL || 'https://rpc.mainnet.chain.robinhood.com',
   {retryCount:0,timeout:30000})});

@@ -1,6 +1,6 @@
 import {existsSync,readFileSync,unlinkSync,writeSync,openSync,closeSync,mkdirSync} from 'node:fs';
 import {resolve} from 'node:path';
-import {ROOT,client,save,failure} from './chain.mjs';
+import {ROOT,client,save,failure,logRpcHealth} from './chain.mjs';
 import {broadcast,enabled} from './telegram.mjs';
 import {
   abcDir,openAbc,initAccounts,readAccount,writeAccount,readRun,writeRun,
@@ -57,8 +57,12 @@ export async function notifyHourlyHoldings(store,run) {
   const hour=new Date().toISOString().slice(0,13);
   if(run.last_holdings_hour===hour) return;
   const accs=['A','B','C'].map(s=>readAccount(store,s));
+  const latest=store.db.prepare(`SELECT MAX(minute) AS minute FROM buckets WHERE invalid=0 AND usd_usable=1 AND token IN (SELECT token FROM watch_slots WHERE status='ACTIVE')`).get();
+  const lag=latest.minute==null?'无可用行情':`${Math.max(0,Math.floor((Date.now()/1000-latest.minute-60)/60))} 分钟`;
+  const counts=store.db.prepare(`SELECT strategy,COUNT(*) AS n FROM screening_evals WHERE observed_at>=? AND funnel_stage IN ('NO_STRATEGY_SIGNAL','STRATEGY_SIGNAL','SAFETY_PASS','SAFETY_FAIL','PAPER_FILL') GROUP BY strategy`).all(Date.now()-3600000);
+  const effective=['A','B','C'].map(s=>`${s}:${counts.find(x=>x.strategy===s)?.n||0}`).join('，');
   const result=await notifySafe(run,`hourly-holdings:${run.started_at}:${hour}`,
-    `📊 ABC 每小时持仓（纸面模拟，非实盘）\n报告时间：${new Date().toISOString()}\n状态：${run.status}\n最近完成轮：${run.last_completed_at?new Date(run.last_completed_at).toISOString():'尚无'}\n${accs.map(accountSummary).join('\n\n')}`);
+    `📊 ABC 每小时持仓（纸面模拟，非实盘）\n报告时间：${new Date().toISOString()}\n状态：${run.status}\n行情落后：${lag}\n最近60分钟有效评估：${effective}\n最近完成轮：${run.last_completed_at?new Date(run.last_completed_at).toISOString():'尚无'}\n${accs.map(accountSummary).join('\n\n')}`);
   if(result?.message_id||result?.duplicate) run.last_holdings_hour=hour;
   writeRun(store,run);
 }
@@ -187,6 +191,7 @@ export async function cycle(store,now=Date.now(),io={}) {
   });
   run.collect_deferred=deferred;
   run.rpc_profile=rpcProfile.slice(0,20);
+  run.log_rpc_health={...logRpcHealth};
   run.miss_counts=store.db.prepare('SELECT reason,count(*) c FROM minute_status GROUP BY reason').all();
   run.rpc_gap_counts=store.db.prepare('SELECT reason,count(*) c FROM coverage_gaps GROUP BY reason').all();
   for(const s of ['A','B','C']) accounts[s]=readAccount(store,s);

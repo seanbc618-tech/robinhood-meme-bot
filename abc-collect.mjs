@@ -604,7 +604,7 @@ export async function collectBuckets(store,row,pool,block,rates,io={}) {
   if(from>block.number) {
     return foldStoredEvents(store,row,pool,block,rates,io);
   }
-  const cap=io.maxLogBlocks??logBlocksNeeded(store);
+  const cap=io.maxLogBlocks??(block.number-from>2000n?6000n:logBlocksNeeded(store));
   const limitedTo=from+cap-1n>block.number?block.number:from+cap-1n;
   const tokenIs0=same(pool.token,pool.key.currency0);
   const insertEv=store.db.prepare(`INSERT OR IGNORE INTO swap_events(token,block,log_index,ts,tx,sqrt,token_amount,quote_amount,quote_vol,sender)
