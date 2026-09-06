@@ -62,7 +62,7 @@ export async function notifyHourlyHoldings(store,run) {
     WHERE w.status='ACTIVE' GROUP BY w.slot ORDER BY w.slot`).all();
   const lag=latest.map(x=>`槽${x.slot}：${x.minute==null?'无可用行情':`${Math.max(0,Math.floor((Date.now()/1000-x.minute-60)/60))} 分钟`}`).join('；')||'无观察池';
   const counts=store.db.prepare(`SELECT strategy,COUNT(*) AS n FROM screening_evals WHERE observed_at>=?
-    AND COALESCE(detail_code,'')!='GRADUATION_OVER6H'
+    AND COALESCE(detail_code,'')!='GRADUATION_OVER_6H'
     AND funnel_stage IN ('NO_STRATEGY_SIGNAL','STRATEGY_SIGNAL','SAFETY_PASS','SAFETY_FAIL','PAPER_FILL') GROUP BY strategy`).all(Date.now()-3600000);
   const effective=['A','B','C'].map(s=>`${s}:${counts.find(x=>x.strategy===s)?.n||0}`).join('，');
   const result=await notifySafe(run,`hourly-holdings:${run.started_at}:${hour}`,
@@ -110,8 +110,6 @@ export async function cycle(store,now=Date.now(),io={}) {
   const rates=await (io.usdRates||usdRates)();
   assertFreshness(block,rates,now/1000);
   saveFxSnap(store,rates);
-  run.usd_source_age_sec=usdSourceAge(rates,now/1000);
-  run.usd_source_older_than_120s=run.usd_source_age_sec>STALE_SEC;
   const gasPrice=io.gasPrice!=null?io.gasPrice:await client.getGasPrice();
   const accounts={};
   for(const s of ['A','B','C']) accounts[s]=readAccount(store,s);
@@ -194,6 +192,9 @@ export async function cycle(store,now=Date.now(),io={}) {
     status:run.status,last_started_at:run.last_started_at,code_version:CODE_VERSION,exits_ms:run.exits_ms,
     live_watch:run.live_watch,last_pool_error:run.last_pool_error,
   });
+  // Apply this cycle's FX diagnostics after merging persisted collector state.
+  run.usd_source_age_sec=usdSourceAge(rates,now/1000);
+  run.usd_source_older_than_120s=run.usd_source_age_sec>STALE_SEC;
   run.collect_deferred=deferred;
   run.rpc_profile=rpcProfile.slice(0,20);
   run.log_rpc_health={...logRpcHealth};
