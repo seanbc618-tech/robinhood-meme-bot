@@ -1,13 +1,14 @@
 import {failure} from './chain.mjs';
 import {
   readAccount,writeAccount,plannedRoundTrip,plannedRoundTripFromQuotes,netExitValue,
-  safetyScreen,requireRoundTrip,haircutQty,HAIRCUT_BPS,STRATEGY_VERSION,
+  requireRoundTrip,haircutQty,HAIRCUT_BPS,STRATEGY_VERSION,
   classifyError,quoteExact,assertTradeFresh,poolFor,
 } from './abc-collect.mjs';
 import {
   applyDayBaseline,canEnter,applyBuy,applySell,exitDecision,sellQtyFor,recomputeEquity,pnlMultiple,
 } from './abc-paper.mjs';
 import {signalId} from './abc-strategy.mjs';
+import {safetyScreen} from './abc-safety-evidence.mjs';
 
 export async function markAndExit(store,account,block,rates,gasPrice,now,io={}) {
   const quoteNet=io.netExitValue||netExitValue;

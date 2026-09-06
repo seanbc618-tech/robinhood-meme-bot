@@ -4,8 +4,9 @@ import {resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {ROOT,save,failure} from './chain.mjs';
 import {
-  abcDir,openAbc,openAbcReadonly,initAccounts,readAccount,readRun,DEFAULT_HOURS,stringify,catalogStats,
+  abcDir,openAbc,initAccounts,readAccount,readRun,DEFAULT_HOURS,stringify,catalogStats,
 } from './abc-collect.mjs';
+import {openAbcReadonly} from './abc-collect-readonly.mjs';
 import {screeningReport} from './abc-screening.mjs';
 
 export {
