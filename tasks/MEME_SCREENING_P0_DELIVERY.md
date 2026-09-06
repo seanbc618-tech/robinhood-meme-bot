@@ -1,6 +1,6 @@
 # MEME_SCREENING_P0 Delivery
 
-Diagnose-only meme screening P0 on top of merged GROK_SCREENING_V1 (PR #1).  
+Diagnose-only meme screening P0 on top of merged GROK_SCREENING_V1 (PR #1).
 **Paper telemetry only — does not change buy/entry gates, fees, FX 120s, positions, watch slot TTL, or exit rules.**
 
 ## Summary
@@ -9,7 +9,7 @@ Diagnose-only meme screening P0 on top of merged GROK_SCREENING_V1 (PR #1).
 |---|---|
 | Dual top10 metrics (`top10_raw` + `top10_ex_lp`) | Done (additive diagnose fields) |
 | Gate `top10_circulating_bps` @ 6000 | **Unchanged** |
-| Explicit `OBSERVING` funnel stage | Done (≠ AGE, ≠ generic DATA_INCOMPLETE) |
+| Explicit `OBSERVING` funnel stage | Done (!= AGE, != generic DATA_INCOMPLETE) |
 | Round-trip paper-size diagnostic evidence | Done (components disclosed; reject threshold **unchanged** at 5%) |
 | Offline verify cases | Done (`abc-screening-verify-pr1.mjs` P0 block) |
 | Worker restart / DB reset / live trading | **Not touched** |
@@ -18,14 +18,15 @@ Diagnose-only meme screening P0 on top of merged GROK_SCREENING_V1 (PR #1).
 
 | File | Change |
 |---|---|
-| `chain.mjs` | `holderData` summary gains additive `top10_raw_total_supply_bps`, `top10_ex_lp_*`, `infra_held_raw`, `lp_exclusion` — gate fields unchanged |
-| `abc-screening-risk.mjs` | `dualTop10Concentration()`; `quoteLossBreakdown` gains `paper_size_diagnostic` + `gate_unchanged` |
-| `abc-screening-funnel.mjs` | `OBSERVING` stage; additive `top10_raw`/`top10_ex_lp` checks in `buildSafetyChecks`; `SCREENING_VERSION=screening-v1-p0` |
+| `abc-screening-p0-metrics.mjs` | **NEW** — `dualTop10Concentration` + enhanced `quoteLossBreakdown` (`paper_size_diagnostic`, `gate_unchanged`) |
+| `abc-screening-risk.mjs` | Slim barrel: re-exports P0 metrics; keeps attributedBuy/maxBuyShare/creator |
+| `abc-screening-funnel.mjs` | `OBSERVING` stage; additive `top10_raw`/`top10_ex_lp` checks; `SCREENING_VERSION=screening-v1-p0` |
 | `abc-screening-upsert.mjs` | `risk.dual_top10` on each eval |
 | `abc-screening.mjs` | Re-export `dualTop10Concentration` |
-| `abc-safety-evidence.mjs` | Additive dual top10 diagnose checks (gate PASS/FAIL unchanged) |
+| `abc-safety-evidence.mjs` | Dual top10 diagnose checks + enrich summary with `lp_exclusion` from infrastructure (gate unchanged) |
 | `abc-screening-report.mjs` | `OBSERVING` stage counts + funnel denominator |
-| `abc-screening-verify-pr1.mjs` | OBSERVING classification + dual top10 + RT paper-size cases |
+| `abc-screening-verify-pr1.mjs` | OBSERVING + dual top10 + RT paper-size cases |
+| `abc-screening-verify-p0-smoke.mjs` | Optional offline smoke (needs Node that can load collect/sqlite) |
 | `tasks/MEME_SCREENING_P0_DELIVERY.md` | This doc |
 
 ## Diagnose-only confirmation
@@ -43,17 +44,15 @@ Diagnose-only meme screening P0 on top of merged GROK_SCREENING_V1 (PR #1).
 | `DATA_INCOMPLETE` | History/data warmups: `WARMUP`, `WARMUP_LT_120M`, `NO_T` detail |
 | `OBSERVING` | Consecutive-minute / observation window incomplete: `WARMUP_LT_30_CONSECUTIVE`, `WINDOW_INCOMPLETE` |
 
-Aligned with PR1: **WARMUP ≠ AGE**. P0 adds: **OBSERVING ≠ AGE** and **OBSERVING ≠ generic DATA_INCOMPLETE**.
+Aligned with PR1: **WARMUP != AGE**. P0 adds: **OBSERVING != AGE** and **OBSERVING != generic DATA_INCOMPLETE**.
 
 ## Dual top10 semantics
 
 | Field | Meaning |
 |---|---|
-| `top10_raw` / `top10_raw_total_supply_bps` | Top10 of **all** positive balances (incl. identifiable LP/infra) / total supply |
-| `top10_ex_lp` / `top10_ex_lp_circulating_bps` | Top10 excluding LP/infra / circulating_ex_infra (same basis as gate) |
-| `lp_exclusion` | `OBSERVED` with addresses when identifiable; else `UNKNOWN` + reason — **never invent** |
-
-Legacy payloads without additive fields: raw falls back to `top10_total_supply_bps` with an honest note; missing LP metadata → UNKNOWN when exclusion cannot be confirmed.
+| `top10_raw` | Prefer `top10_raw_total_supply_bps` when present; else honest fallback to `top10_total_supply_bps` (ex-infra/total_supply) |
+| `top10_ex_lp` | `top10_ex_lp_circulating_bps` / `top10_circulating_bps` (circulating_ex_infra; same basis as gate) |
+| `lp_exclusion` | Attached from `holderData.infrastructure` when available; else `UNKNOWN` + reason — **never invent** |
 
 ## How to verify
 
@@ -65,18 +64,6 @@ node abc-screening-verify.mjs
 node abc.mjs screening-report
 ```
 
-Pure dual-top10 / funnel smoke (no sqlite):
-
-```bash
-node --input-type=module -e "
-import {dualTop10Concentration,quoteLossBreakdown} from './abc-screening-risk.mjs';
-import {classifyFunnelStage} from './abc-screening-funnel.mjs';
-console.log(dualTop10Concentration(null).top10_raw.status);
-console.log(classifyFunnelStage({watched:true,ev:{reason:'WARMUP_LT_30_CONSECUTIVE'},gradTs:1}));
-console.log(quoteLossBreakdown({initial:30,loss_pct:0.01,haircut_bps:50}).gate_unchanged);
-"
-```
-
 ## Remaining gaps (later — not this PR)
 
 - **Entity merge** Top10 / HHI (Binance-style clustering) — P3 in research report
@@ -85,6 +72,7 @@ console.log(quoteLossBreakdown({initial:30,loss_pct:0.01,haircut_bps:50}).gate_u
 - Creator net-sell still UNKNOWN until deployer + sells + balance plumbed
 - Quoter fee vs impact still merged (disclosed); L1 allowance UNKNOWN
 - Production funnel needs a worker that has written `screening_evals` after deploy
+- True `top10_raw` including LP balances in the numerator awaits optional `chain.mjs` additive fields (`top10_raw_total_supply_bps` from all-positive balances); current path attaches `lp_exclusion` from infrastructure and falls back honestly for raw
 
 ## Constraints honored
 
