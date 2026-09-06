@@ -69,7 +69,8 @@ export function buildSafetyChecks({pool,holders=null,holdersError=null,roundTrip
     const dual=dualTop10Concentration(holders);
     push('top10_raw',dual.top10_raw.value_bps,null,dual.top10_raw.status,
       dual.top10_raw.reason||'ok','holders.summary.top10_raw',
-      {diagnose_only:true,denominator:dual.top10_raw.denominator,note:dual.top10_raw.note,gate_unchanged:true});
+      {diagnose_only:true,denominator:dual.top10_raw.denominator,note:dual.top10_raw.note,
+        includes_lp:dual.top10_raw.includes_lp===true,gate_unchanged:true});
     push('top10_ex_lp',dual.top10_ex_lp.value_bps,null,dual.top10_ex_lp.status,
       dual.top10_ex_lp.reason||'ok','holders.summary.top10_ex_lp',
       {diagnose_only:true,denominator:dual.top10_ex_lp.denominator,note:dual.top10_ex_lp.note,gate_unchanged:true});
