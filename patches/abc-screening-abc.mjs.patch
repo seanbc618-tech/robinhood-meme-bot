@@ -1,0 +1,85 @@
+--- a/abc.mjs
++++ b/abc.mjs
+@@ -17,6 +17,9 @@
+   pickLiveWatch,skipBacklogForLive,LIVE_WATCH_N,rpcTimeout,saveFxSnap,logBlocksNeeded,
+   extendActiveWatchBounds,
+ } from './abc-collect.mjs';
++import {
++  recordEvalFromCycle,screeningReport,ensureScreeningSchema,
++} from './abc-screening.mjs';
+ 
+ export function remainingFraction(p) {
+   const q=BigInt(p.qty),i=BigInt(p.initialQty);
+@@ -409,7 +412,7 @@
+   if(account.seen.includes(token)) {count(account,'ALREADY_OWNED');writeAccount(store,account);return {skipped:'ALREADY_OWNED'};}
+   if(Number(block.timestamp)<signal.minute+60) {count(account,'FILL_BEFORE_SIGNAL_COMPLETE');writeAccount(store,account);return {skipped:'FILL_BEFORE_SIGNAL_COMPLETE'};}
+   const screen=await (io.safetyScreen||safetyScreen)(store,pool,block,rates);
+-  if(!screen.ok) {for(const r of screen.reasons) count(account,r);writeAccount(store,account);return {skipped:screen.reasons.join(',')};}
++  if(!screen.ok) {for(const r of screen.reasons) count(account,r);writeAccount(store,account);return {skipped:screen.reasons.join(','),safety:screen};}
+   const principal=account.principal_limit;
+   let plan;
+   try {plan=await (io.plannedRoundTrip||plannedRoundTrip)(pool,principal,block,rates,gasPrice,HAIRCUT_BPS);}
+@@ -445,7 +448,7 @@
+   recomputeEquity(account);
+   applyDayBaseline(account,commitAt);
+   writeAccount(store,account);
+-  return {filled:true,plan};
++  return {filled:true,plan,safety:screen};
+ }
+ function count(account,reason) {
+   account.reject_counts[reason]=(account.reject_counts[reason]||0)+1;
+@@ -460,6 +463,7 @@
+ 
+ export async function cycle(store,now=Date.now(),io={}) {
+   const t0=Date.now();
++  ensureScreeningSchema(store);
+   const run=readRun(store);
+   run.status='CYCLE';run.last_started_at=now;run.code_version=CODE_VERSION;
+   writeRun(store,run);
+@@ -506,14 +510,30 @@
+         const ev=evaluators[strat](buckets,prev,grad,lastComplete);
+         acc.signal_state[row.token]=ev.persist;
+         if(ev.reason) {
++          // Keep aggregate NO_T (and other reasons) exactly as before for reject_counts compatibility
+           acc.reject_counts[ev.reason]=(acc.reject_counts[ev.reason]||0)+1;
+           if(String(ev.reason).startsWith('WARMUP')) warmup[strat]++;
+         }
+         writeAccount(store,acc);
++        let enterResult=null;
+         if(ev.signal&&!ending) {
+           const result=await tryEnter(store,acc,row.token,ev.signal,pool,block,rates,gasPrice,now,io);
++          enterResult=result;
+           Object.assign(acc,readAccount(store,acc.strategy));
+           signals.push({strategy:strat,token:row.token,minute:ev.signal.minute,result:slimSignalResult(result)});
++        }
++        // Diagnose-only unique eval row; does not gate buys
++        try {
++          if(!io.skipScreeningRecord) {
++            recordEvalFromCycle(store,{
++              strategy:strat,token:row.token,minute:lastComplete,ev,gradTs:grad,watched:true,
++              buckets,pool,safety:enterResult?{...(enterResult.safety||{}),plan:enterResult.plan||null}:null,
++              paperFilled:!!(enterResult&&enterResult.filled),
++              codeVersion:CODE_VERSION,
++            });
++          }
++        } catch(screenErr) {
++          run.last_screening_error=failure(screenErr);
+         }
+       }
+       analyzed.push(row.token);
+@@ -715,5 +735,13 @@
+     }
+     console.log('ABC stop requested; worker finishes current cycle.');
+   } else if(cmd==='report') printReport(dir);
+-  else throw new Error('Usage: node abc.mjs start [hours] | run [hours] | status | stop | report');
+-}
++  else if(cmd==='screening-report') {
++    const store=openAbc(dir);
++    try {
++      ensureScreeningSchema(store);
++      const rep=screeningReport(store,{readOnly:true});
++      console.log(stringify(rep));
++    } finally {store.close();}
++  }
++  else throw new Error('Usage: node abc.mjs start [hours] | run [hours] | status | stop | report | screening-report');
++}
