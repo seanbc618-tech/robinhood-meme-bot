@@ -33,11 +33,18 @@ export async function safetyScreen(store,pool,block,rates) {
       note:'LP/infra from holderData.infrastructure (zeroAddress+manager+router+hook+locker+curve+factory+permit2)'};
     if(summary.top10_ex_lp_circulating_bps==null) summary.top10_ex_lp_circulating_bps=summary.top10_circulating_bps??null;
     if(summary.top10_ex_lp_total_supply_bps==null) summary.top10_ex_lp_total_supply_bps=summary.top10_total_supply_bps??null;
-    // True raw-with-LP needs balances; until chain.mjs emits top10_raw_*, fall back honestly.
-    if(summary.top10_raw_total_supply_bps==null&&summary.top10_total_supply_bps!=null) {
-      summary.top10_raw_total_supply_bps=summary.top10_total_supply_bps;
+    // Legacy top10_total_supply_bps is ex-infra (chain removes infra before numerator).
+    // Do NOT copy it into top10_raw_* — that field means raw-including-LP only when includes_lp=true.
+    // Expose clearly named legacy diagnostic; leave true raw UNKNOWN until chain emits it.
+    if(summary.top10_ex_infra_total_supply_bps==null&&summary.top10_total_supply_bps!=null) {
+      summary.top10_ex_infra_total_supply_bps=summary.top10_total_supply_bps;
+    }
+    // If a prior path already copied legacy into top10_raw_* without includes_lp=true, force honest flag.
+    if(summary.top10_raw_total_supply_bps!=null&&summary.top10_raw_includes_lp!==true) {
       summary.top10_raw_includes_lp=false;
-      summary.top10_raw_note='Fallback ex-infra/total_supply; true raw-with-LP awaits chain.mjs additive field';
+      if(!summary.top10_raw_note) {
+        summary.top10_raw_note='top10_raw_total_supply_bps without includes_lp=true — treat as ex-infra-style, NOT raw-including-LP';
+      }
     }
   }
   const checks=buildSafetyEvidence(pool,summary,holdersError);
@@ -88,10 +95,18 @@ export function buildSafetyEvidence(pool,holdersSummary,holdersError) {
     const dual=dualTop10Concentration(holdersSummary);
     push('top10_raw',dual.top10_raw.value_bps,null,dual.top10_raw.status,
       dual.top10_raw.reason||'ok','holders.summary.top10_raw',
-      {diagnose_only:true,denominator:dual.top10_raw.denominator,note:dual.top10_raw.note,gate_unchanged:true});
+      {diagnose_only:true,denominator:dual.top10_raw.denominator,note:dual.top10_raw.note,
+        includes_lp:dual.top10_raw.includes_lp===true,gate_unchanged:true});
     push('top10_ex_lp',dual.top10_ex_lp.value_bps,null,dual.top10_ex_lp.status,
       dual.top10_ex_lp.reason||'ok','holders.summary.top10_ex_lp',
       {diagnose_only:true,denominator:dual.top10_ex_lp.denominator,note:dual.top10_ex_lp.note,gate_unchanged:true});
+    if(dual.top10_ex_infra_total_supply_bps) {
+      push('top10_ex_infra_total_supply_bps',dual.top10_ex_infra_total_supply_bps.value_bps,null,
+        dual.top10_ex_infra_total_supply_bps.status,
+        dual.top10_ex_infra_total_supply_bps.reason||'ok','holders.summary.top10_ex_infra_total_supply_bps',
+        {diagnose_only:true,denominator:'total_supply',includes_lp:false,
+          note:dual.top10_ex_infra_total_supply_bps.note,gate_unchanged:true});
+    }
   }
   push('round_trip_loss_pct',null,0.05,'UNKNOWN','ROUND_TRIP_DEFERRED_UNTIL_ENTRY','tryEnter.plannedRoundTrip',
     {note:'Heavy holderData/sim only on real entry signal path; not run during collect'});
