@@ -84,24 +84,38 @@ export async function tryEnter(store,account,token,signal,pool,block,rates,gasPr
   if(frozen) {count(account,frozen);writeAccount(store,account);return {skipped:frozen};}
   if(account.seen.includes(token)) {count(account,'ALREADY_OWNED');writeAccount(store,account);return {skipped:'ALREADY_OWNED'};}
   if(Number(block.timestamp)<signal.minute+60) {count(account,'FILL_BEFORE_SIGNAL_COMPLETE');writeAccount(store,account);return {skipped:'FILL_BEFORE_SIGNAL_COMPLETE'};}
-  const screen=await (io.safetyScreen||safetyScreen)(store,pool,block,rates);
+  // Collection can use a lightweight row-shaped pool. Entry checks and quotes
+  // require the live liquidity, sqrt price, full PoolKey, and launch metadata.
+  // Hydrate only incomplete cached objects so test/injected full pools remain
+  // deterministic and the live path never treats missing fields as zero.
+  let entryPool=pool;
+  if(!entryPool||entryPool.liquidity==null||entryPool.sqrtPriceX96==null) {
+    try {
+      entryPool=await (io.poolFor||poolFor)(token,block.number);
+    } catch(error) {
+      const kind=classifyError(error);
+      count(account,kind);writeAccount(store,account);
+      return {skipped:kind,safety:{ok:false,reasons:[kind],error:failure(error)}};
+    }
+  }
+  const screen=await (io.safetyScreen||safetyScreen)(store,entryPool,block,rates);
   if(!screen.ok) {for(const r of screen.reasons) count(account,r);writeAccount(store,account);return {skipped:screen.reasons.join(','),safety:screen};}
   const principal=account.principal_limit;
   let plan;
-  try {plan=await (io.plannedRoundTrip||plannedRoundTrip)(pool,principal,block,rates,gasPrice,HAIRCUT_BPS);}
+  try {plan=await (io.plannedRoundTrip||plannedRoundTrip)(entryPool,principal,block,rates,gasPrice,HAIRCUT_BPS);}
   catch(error) {count(account,classifyError(error));writeAccount(store,account);return {skipped:failure(error),safety:{...screen,plan:null,checks:screen.checks||null}};}
   if(plan.cash_out>account.spend_limit) {count(account,'CASH_OUT_OVER_CAP');writeAccount(store,account);return {skipped:'CASH_OUT_OVER_CAP',safety:screen,plan};}
   if(account.cash-plan.cash_out<account.reserve) {count(account,'RESERVE_FLOOR');writeAccount(store,account);return {skipped:'RESERVE_FLOOR',safety:screen,plan};}
   if(!(plan.loss_pct<=0.05)) {count(account,'ROUND_TRIP_COST_OVER_5_PERCENT');writeAccount(store,account);return {skipped:'ROUND_TRIP_COST_OVER_5_PERCENT',safety:{...screen,ok:false,checks:(screen.checks||[]).concat([{name:'round_trip_loss_pct',value:plan.loss_pct,threshold:0.05,status:'FAIL',reason:'ROUND_TRIP_COST_OVER_5_PERCENT',source:'plannedRoundTrip.loss_pct'}])},plan};}
-  const sim=await (io.requireRoundTrip||requireRoundTrip)(pool,plan.amountIn,block);
+  const sim=await (io.requireRoundTrip||requireRoundTrip)(entryPool,plan.amountIn,block);
   if(!sim.ok) {count(account,sim.reason==='USDG_SIMULATION_REQUIRES_FUNDED_ACCOUNT'?sim.reason:'ROUND_TRIP_SIM_FAILED');writeAccount(store,account);return {skipped:sim.reason,safety:screen,plan};}
   let stress={};
   try {
     if(io.stress) stress=io.stress;
     else for(const bps of [150n,300n]) {
       const qty=haircutQty(plan.buy.amountOut,bps);
-      const sell=await quoteExact(pool,pool.token,qty,block.number);
-      stress['bps_'+String(bps)]=plannedRoundTripFromQuotes(plan.buy,sell,pool,principal,qty,rates,gasPrice,bps);
+      const sell=await quoteExact(entryPool,entryPool.token,qty,block.number);
+      stress['bps_'+String(bps)]=plannedRoundTripFromQuotes(plan.buy,sell,entryPool,principal,qty,rates,gasPrice,bps);
     }
   } catch {stress.incomplete=true;}
   const commitAt=clock();
@@ -114,7 +128,7 @@ export async function tryEnter(store,account,token,signal,pool,block,rates,gasPr
   if(!ok) {count(account,'APPLY_BUY_REJECTED');writeAccount(store,account);return {skipped:'APPLY_BUY_REJECTED',safety:screen,plan};}
   account.used_signals.push(sid);
   try {
-    const marked=await quoteNet(pool,plan.qty,block,rates,gasPrice);
+    const marked=await quoteNet(entryPool,plan.qty,block,rates,gasPrice);
     const pos=account.positions.find(p=>p.token===token);
     if(pos) {pos.mark=marked.mark;pos.mark_raw=marked.net;}
   } catch {const pos=account.positions.find(p=>p.token===token);if(pos) pos.mark=null;}

@@ -99,6 +99,29 @@ function tmp(){return mkdtempSync(join(tmpdir(),'abc-repair-'));}
 {
   const dir=tmp();
   try {
+    const store=openAbc(dir);initAccounts(store);const account=readAccount(store,'A');
+    const cachePool={token:'0xabc',id:'0xpool',quote:zeroAddress,quoteDecimals:18,decimals:18,launch:{phase:2},key:{currency0:'0xabc',currency1:zeroAddress}};
+    const hydrated={...cachePool,liquidity:1n,sqrtPriceX96:1n,launch:{phase:2,curve:'0xcurve',deployer:'0xdeployer'},key:{...cachePool.key,fee:0,tickSpacing:1,hooks:'0xhook'}};
+    let seen=null,calls=0;
+    const block={number:1n,timestamp:1000n};
+    const rates={observed_at:1000,prices:{ethereum:{usd:1,last_updated_at:1000},tether:{usd:1,last_updated_at:1000},'global-dollar':{usd:1,last_updated_at:1000}}};
+    const io={
+      poolFor:async()=>{calls++;return hydrated;},
+      safetyScreen:async(_store,p)=>{seen=p;return {ok:true,reasons:[]};},
+      plannedRoundTrip:async()=>({qty:10n,cash_out:30.5,loss_pct:0.01,amountIn:1n,buy:{amountOut:10n},sell:{amountOut:1n}}),
+      requireRoundTrip:async()=>({ok:true,sim:{status:'SIMULATED_NOT_FILLED'}}),
+      netExitValue:async()=>({usd:30,gas:1,net:29,mark:29,uneconomic:false}),
+      stress:{},now:()=>1000*1000,
+    };
+    const result=await tryEnter(store,account,'0xabc',{minute:900,block:1},cachePool,block,rates,1n,1000*1000,io);
+    assert('tryEnter hydrates cached pool before safety/quote',result.filled===true&&seen===hydrated&&calls===1,{result,seen,calls});
+    store.close();
+  } finally {rmSync(dir,{recursive:true,force:true});}
+}
+
+{
+  const dir=tmp();
+  try {
     const store=openAbc(dir);
     initAccounts(store);
     const token='0x00000000000000000000000000000000000000aa';
@@ -423,6 +446,7 @@ assert('strategy version is v7',STRATEGY_VERSION==='abc-phase1-v7');
       blockContext:async()=>({number:10n,timestamp:BigInt(headTs),hash:'0x'}),
       usdRates:async()=>({observed_at:headTs,prices:{ethereum:{usd:1,last_updated_at:headTs},tether:{usd:1,last_updated_at:headTs},'global-dollar':{usd:1,last_updated_at:headTs}}}),
       enrichPool:async()=>fakePool,
+      poolFor:async()=>fakePool,
       collectBuckets:async()=>({minutes:35}),
       safetyScreen:async()=>({ok:true,reasons:[]}),
       plannedRoundTrip:async()=>({qty:10n,cash_out:30.5,loss_pct:0.01,buyGas:0.5,sellGas:0.5,amountIn:1n,buy:{amountOut:10n,quoterGasEstimate:1n},sell:{amountOut:1n,quoterGasEstimate:1n}}),

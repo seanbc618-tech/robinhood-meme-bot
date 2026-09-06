@@ -91,7 +91,11 @@ export function evaluateC(buckets,persist,gradTs,minuteT) {
   const last30=takeWindow(map,minuteT-29*60,minuteT+60);
   const ready=!!last30&&!last30.some(b=>b.close_usd==null)&&age>=30*60;
   let s=persist&&persist.phase?{...persist}:{phase:'seek',low:null};
-  if(s.phase==='fired') s={phase:'seek',low:t.low_usd};
+  if(s.phase==='fired') s={phase:'seek',low:t.low_usd,low_minute:t.minute};
+  // Older persisted states may have a low without the minute that established
+  // it. Record the current observed bucket conservatively; do not invent a
+  // historical timestamp that could manufacture a wave.
+  if(s.phase==='seek'&&s.low!=null&&s.low_minute==null) s={...s,low_minute:t.minute};
   if(s.phase==='seek') {
     if(s.low==null||t.low_usd<s.low) {s.low=t.low_usd;s.low_minute=t.minute;}
     if(s.low_minute!=null&&t.minute>s.low_minute&&s.low>0&&t.high_usd>=s.low*1.30)
@@ -100,13 +104,13 @@ export function evaluateC(buckets,persist,gradTs,minuteT) {
   }
   if(s.phase==='wave') {
     if(t.high_usd>s.peak) s={...s,peak:t.high_usd};
-    if(t.close_usd<s.peak*0.70) return {signal:null,persist:{phase:'seek',low:t.low_usd},reason:'WAVE_INVALIDATED'};
+    if(t.close_usd<s.peak*0.70) return {signal:null,persist:{phase:'seek',low:t.low_usd,low_minute:t.minute},reason:'WAVE_INVALIDATED'};
     if(t.close_usd<=s.peak*0.85&&t.close_usd>=s.peak*0.70)
       return {signal:null,persist:{...s,phase:'pullback',pullback_start:minuteT,pullbacks:[minuteT]}};
     return {signal:null,persist:s};
   }
   if(s.phase==='pullback') {
-    if(t.close_usd<s.peak*0.70) return {signal:null,persist:{phase:'seek',low:t.low_usd},reason:'WAVE_INVALIDATED'};
+    if(t.close_usd<s.peak*0.70) return {signal:null,persist:{phase:'seek',low:t.low_usd,low_minute:t.minute},reason:'WAVE_INVALIDATED'};
     const pullbacks=[...(s.pullbacks||[]),minuteT];
     s={...s,pullbacks};
     if(pullbacks.length<4) return {signal:null,persist:s};

@@ -113,6 +113,16 @@ const gradC=t0-3600;
   assert('C arms first-wave then pullback then trigger',!!ev.signal&&ev.signal.strategy==='C',ev);
 }
 
+{
+  const minute=t0+200*60;
+  const bars=series(minute-29*60,30,100,{h:100,l:100,buy_recipients:recips(8),net:10});
+  const afterReject=evaluateC(bars,{phase:'fired',peak:150},t0,minute);
+  assert('C fired reset records low minute',afterReject.persist.phase==='seek'&&afterReject.persist.low_minute===minute,afterReject);
+  const rebound=bar(minute+60,130,{h:140,l:100,buy_recipients:recips(8),net:10});
+  const afterRebound=evaluateC([...bars,rebound],afterReject.persist,t0,minute+60);
+  assert('C rebound can arm a new wave after reset',afterRebound.persist.phase==='wave'&&afterRebound.persist.low_minute===minute,afterRebound);
+}
+
 function freshAccount(strategy='A',principal=30,spend=35) {
   return {strategy,cash:1000,reserve:200,principal_limit:principal,spend_limit:spend,
     halted_permanent:false,halted_day:false,day_key:null,day_baseline:null,equity:1000,unrealized:0,realized:0,

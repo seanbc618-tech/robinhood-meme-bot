@@ -57,6 +57,7 @@ function bar(minute,c,extra={}){const r=extra.buy_recipients||{};return{minute,o
     const checks=buildSafetyChecks({pool:{launch:{phase:2},liquidity:1n,sqrtPriceX96:1n,quote:zeroAddress},holders:null});
     const hc=checks.find(c=>c.name==='holder_count');
     assert('holder unknown is UNKNOWN not 0 PASS',hc&&hc.status==='UNKNOWN'&&hc.value==null,hc);
+    assert('C over-age rejection is AGE_INCOMPLETE',classifyFunnelStage({watched:true,ev:{signal:null,reason:'GRADUATION_OVER_6H'},gradTs:minute-60,minute})==='AGE_INCOMPLETE');
     const beforeBuckets=store.db.prepare('SELECT count(*) c FROM buckets').get().c;
     const beforeTables=store.db.prepare(`SELECT count(*) c FROM sqlite_master WHERE type='table'`).get().c;
     const rep=screeningReport(store,{readOnly:true});

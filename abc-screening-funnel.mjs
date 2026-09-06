@@ -104,7 +104,7 @@ export function classifyFunnelStage({watched,diag,ev,gradTs,minute,safetyOk,pape
   if(ev?.signal&&safetyOk===false) return 'SAFETY_FAIL';
   if(ev?.signal) return 'STRATEGY_SIGNAL';
   const reason=ev?.reason!=null?String(ev.reason):'';
-  if(reason==='GRADUATION_TIME_UNKNOWN'||reason.startsWith('WARMUP_GRADUATION')) return 'AGE_INCOMPLETE';
+  if(reason==='GRADUATION_TIME_UNKNOWN'||reason==='GRADUATION_OVER_6H'||reason.startsWith('WARMUP_GRADUATION')) return 'AGE_INCOMPLETE';
   // Consecutive-minute / observation-window incomplete -> explicit OBSERVING stage
   if(reason==='WARMUP_LT_30_CONSECUTIVE'||reason==='WINDOW_INCOMPLETE'||reason==='OBSERVING')
     return 'OBSERVING';
