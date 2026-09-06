@@ -3,7 +3,7 @@ import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {zeroAddress} from 'viem';
-import {openAbc,CODE_VERSION,minuteStart,HAIRCUT_BPS} from './abc-collect.mjs';
+import {openAbc,CODE_VERSION,minuteStart,HAIRCUT_BPS,plannedRoundTripFromQuotes} from './abc-collect.mjs';
 import {openAbcReadonly} from './abc-collect-readonly.mjs';
 import {
   screeningReport,ensureScreeningSchema,
@@ -26,10 +26,12 @@ export function runPr1Regressions(assert) {
     JSON.parse(encoded);
   } catch(e) { threw=true; console.log('bigint err',e); }
   assert('BigInt haircut_bps quoteLossBreakdown JSON-safe',!threw&&encoded&&typeof breakdown.parts.haircut_bps.value!=='bigint',breakdown);
-  assert('merged fee+impact discloses haircut separate',
-    breakdown.parts.quoter_fee_and_impact_merged.includes_haircut===false
-    && /haircut/i.test(breakdown.parts.quoter_fee_and_impact_merged.note),
+  assert('merged residual labels includes_haircut honestly',
+    breakdown.parts.quoter_fee_and_impact_merged.includes_haircut===true
+    && /haircut/i.test(breakdown.parts.quoter_fee_and_impact_merged.note)
+    && /double-count|embedded|COMBINED/i.test(breakdown.parts.quoter_fee_and_impact_merged.note),
     breakdown.parts.quoter_fee_and_impact_merged);
+  assert('complete true only when plan amounts present',breakdown.complete===true,breakdown);
 
   const dir=mkdtempSync(join(tmpdir(),'abc-screen-bigint-'));
   try {
@@ -167,6 +169,7 @@ export function runPr1Regressions(assert) {
     top10_circulating_bps:2500,
     top10_total_supply_bps:2000,
     top10_raw_total_supply_bps:4500,
+    top10_raw_includes_lp:true,
     top10_ex_lp_circulating_bps:2500,
     top10_ex_lp_total_supply_bps:2000,
     lp_exclusion:{status:'OBSERVED',excluded_count:3,addresses:['0xa','0xb','0xc'],note:'test'},
@@ -174,7 +177,23 @@ export function runPr1Regressions(assert) {
   const d=dualTop10Concentration(dual);
   assert('dual top10_raw OBSERVED from additive field',d.top10_raw.status==='OBSERVED'&&d.top10_raw.value_bps===4500,d.top10_raw);
   assert('dual top10_ex_lp OBSERVED',d.top10_ex_lp.status==='OBSERVED'&&d.top10_ex_lp.value_bps===2500,d.top10_ex_lp);
-  assert('dual includes_lp true when raw field present',d.top10_raw.includes_lp===true,d.top10_raw);
+  assert('dual includes_lp true only when explicitly flagged',d.top10_raw.includes_lp===true,d.top10_raw);
+  assert('legacy ex-infra diagnostic exposed',d.top10_ex_infra_total_supply_bps.status==='OBSERVED'&&d.top10_ex_infra_total_supply_bps.value_bps===2000&&d.top10_ex_infra_total_supply_bps.includes_lp===false,d.top10_ex_infra_total_supply_bps);
+
+  // Real safety-to-metric fallback path: raw_* present with includes_lp=false (NOT artificial additive-only).
+  const fallbackPath={top10_raw_total_supply_bps:2000,top10_raw_includes_lp:false,top10_circulating_bps:4000,top10_total_supply_bps:2000};
+  const fb=dualTop10Concentration(fallbackPath);
+  assert('fallback path includes_lp false',fb.top10_raw.includes_lp===false,fb.top10_raw);
+  assert('fallback path does not claim raw-including-LP',
+    fb.top10_raw.includes_lp===false
+    && !/incl(?:uding|\.)?\s*identifiable LP/i.test(fb.top10_raw.note||'')
+    && (/ex-infra|NOT raw-including-LP|includes_lp=false/i.test(fb.top10_raw.note||'')||fb.top10_raw.reason==='TOP10_RAW_EX_INFRA_STYLE'),
+    fb.top10_raw);
+  assert('fallback path circulating/ex_lp observed',fb.top10_ex_lp.status==='OBSERVED'&&fb.top10_ex_lp.value_bps===4000,fb.top10_ex_lp);
+  assert('legacy alone never invents includes_lp true',
+    dualTop10Concentration({top10_total_supply_bps:2000,top10_circulating_bps:4000}).top10_raw.includes_lp!==true
+    && dualTop10Concentration({top10_total_supply_bps:2000,top10_circulating_bps:4000}).top10_raw.status==='UNKNOWN',
+    dualTop10Concentration({top10_total_supply_bps:2000,top10_circulating_bps:4000}));
 
   const checks=buildSafetyChecks({
     pool:{launch:{phase:2},liquidity:1n,sqrtPriceX96:1n,quote:zeroAddress},
@@ -198,7 +217,32 @@ export function runPr1Regressions(assert) {
   assert('RT paper_size_diagnostic present',br.paper_size_diagnostic&&br.paper_size_diagnostic.status==='OBSERVED',br.paper_size_diagnostic);
   assert('RT paper size records initial 30',br.paper_size_diagnostic.planned_initial_usd===30,br.paper_size_diagnostic);
   assert('RT gate threshold unchanged 5%',br.gate_threshold_pct===0.05&&br.gate_unchanged===true,br);
-  assert('RT discloses merged fee+impact excl haircut',br.parts.quoter_fee_and_impact_merged.includes_haircut===false,br.parts);
+  assert('RT residual includes_haircut true (recovered embeds haircut)',br.parts.quoter_fee_and_impact_merged.includes_haircut===true,br.parts);
+  assert('RT complete when amounts present',br.complete===true,br);
+
+  // Incomplete plan must not be complete:true
+  const emptyBr=quoteLossBreakdown({});
+  assert('empty plan complete=false',emptyBr.complete===false,emptyBr);
+  assert('empty plan status UNKNOWN',emptyBr.status==='UNKNOWN',emptyBr);
+  const partialBr=quoteLossBreakdown({buy:{},sell:{},haircut_bps:50});
+  assert('partial plan missing amounts complete=false',partialBr.complete===false,partialBr);
+
+  // Actual plannedRoundTripFromQuotes path with nonzero haircut
+  const pool={quote:zeroAddress,quoteDecimals:18};
+  const rates={prices:{ethereum:{usd:3000},'global-dollar':{usd:1}}};
+  const gasPrice=1_000_000_000n; // 1 gwei
+  const buy={amountOut:10n**18n,quoterGasEstimate:100000n};
+  const sell={amountOut:10n**16n,quoterGasEstimate:120000n}; // 0.01 ETH pre-haircut
+  const planRt=plannedRoundTripFromQuotes(buy,sell,pool,30,buy.amountOut,rates,gasPrice,50n);
+  assert('plannedRoundTripFromQuotes haircut_bps nonzero',planRt.haircut_bps===50,planRt);
+  const brRt=quoteLossBreakdown(planRt);
+  assert('plannedRoundTrip path residual includes_haircut',brRt.parts.quoter_fee_and_impact_merged.includes_haircut===true,brRt.parts.quoter_fee_and_impact_merged);
+  assert('plannedRoundTrip path residual value finite',Number.isFinite(brRt.parts.quoter_fee_and_impact_merged.value),brRt.parts.quoter_fee_and_impact_merged);
+  assert('plannedRoundTrip path complete',brRt.complete===true,brRt);
+  assert('haircut rate disclosed separately without double-count note',
+    brRt.parts.haircut_bps.value===50 && /embedded|not an additive/i.test(brRt.parts.haircut_bps.note),
+    brRt.parts.haircut_bps);
 }
+
 
 }
