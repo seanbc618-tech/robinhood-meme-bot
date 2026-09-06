@@ -33,7 +33,7 @@ Diagnose-only meme screening P0 on top of merged GROK_SCREENING_V1 (PR #1).
 
 1. **Top10 gate:** still `holders.summary.top10_circulating_bps` vs 6000 in `safetyScreen` / `buildSafetyEvidence` / `buildSafetyChecks`. New fields are `diagnose_only:true` and never flip `ok`.
 2. **OBSERVING:** classification-only funnel stage for `WARMUP_LT_30_CONSECUTIVE` / `WINDOW_INCOMPLETE`. Strategy `evaluateA/B/C` reasons and signal predicates unchanged.
-3. **RT cost:** `tryEnter` still rejects when `plan.loss_pct > 0.05`. Diagnostics add `paper_size_diagnostic` and disclose haircut vs merged quoter fee+impact — no threshold tighten/loosen.
+3. **RT cost:** `tryEnter` still rejects when `plan.loss_pct > 0.05`. Diagnostics add `paper_size_diagnostic`; residual from recovered is labeled **includes_haircut:true** (combined quoter+haircut; haircut_bps is rate disclosure only) — no threshold tighten/loosen.
 4. No worker restart, no DB reset, no live trading enablement, no Telegram spam from this PR.
 
 ## Funnel stage rules (P0)
@@ -50,9 +50,19 @@ Aligned with PR1: **WARMUP != AGE**. P0 adds: **OBSERVING != AGE** and **OBSERVI
 
 | Field | Meaning |
 |---|---|
-| `top10_raw` | Prefer `top10_raw_total_supply_bps` when present; else honest fallback to `top10_total_supply_bps` (ex-infra/total_supply) |
+| `top10_raw` | True raw-with-LP **only** when `top10_raw_total_supply_bps` present **and** `top10_raw_includes_lp===true`. Otherwise UNKNOWN or honest `includes_lp:false` (never invent includes_lp from legacy alone). |
+| `top10_ex_infra_total_supply_bps` | Legacy/diagnostic ex-infra top10 / total_supply (chain removes infra before numerator). **Not** raw-including-LP. |
 | `top10_ex_lp` | `top10_ex_lp_circulating_bps` / `top10_circulating_bps` (circulating_ex_infra; same basis as gate) |
-| `lp_exclusion` | Attached from `holderData.infrastructure` when available; else `UNKNOWN` + reason — **never invent** |
+| `lp_exclusion` | Attached from `holderData.infrastructure` when available; else `UNKNOWN` + reason — **never invent** from legacy numeric fields |
+
+## PR2 review fixes (labeling honesty)
+
+| Item | Fix |
+|---|---|
+| P1 Top10 mislabel | Stop copying legacy into `top10_raw_*` as raw-including-LP; honor `top10_raw_includes_lp=false`; expose `top10_ex_infra_total_supply_bps` |
+| P1 haircut residual | `quoteLossBreakdown` residual sets `includes_haircut:true` (recovered embeds haircuts); no “excludes haircut” copy; do not double-count |
+| P2 complete flag | `complete:true` only when plan amounts finite; `{}` / partial → `complete:false` / UNKNOWN |
+| Review artifact | `tasks/PR2_REVIEW.md` |
 
 ## How to verify
 
@@ -72,7 +82,7 @@ node abc.mjs screening-report
 - Creator net-sell still UNKNOWN until deployer + sells + balance plumbed
 - Quoter fee vs impact still merged (disclosed); L1 allowance UNKNOWN
 - Production funnel needs a worker that has written `screening_evals` after deploy
-- True `top10_raw` including LP balances in the numerator awaits optional `chain.mjs` additive fields (`top10_raw_total_supply_bps` from all-positive balances); current path attaches `lp_exclusion` from infrastructure and falls back honestly for raw
+- True `top10_raw` including LP balances in the numerator awaits optional `chain.mjs` additive fields (`top10_raw_total_supply_bps` + `top10_raw_includes_lp:true` from all-positive balances); legacy stays under `top10_ex_infra_total_supply_bps`; raw stays UNKNOWN / includes_lp=false until then
 
 ## Constraints honored
 
