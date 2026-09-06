@@ -1,14 +1,6 @@
 /** GROK_SCREENING_V1 observe-only risk metrics (no trade gates). */
-import {HAIRCUT_BPS} from './abc-collect.mjs';
 import {evidence} from './abc-screening-not.mjs';
-
-function asJsonNumberOrString(v) {
-  if(typeof v==='bigint') {
-    const n=Number(v);
-    return Number.isSafeInteger(n)?n:v.toString();
-  }
-  return v;
-}
+export {dualTop10Concentration, quoteLossBreakdown} from './abc-screening-p0-metrics.mjs';
 
 export function attributedBuyRecipients(swaps,transfersByTx,infraSet) {
   const recipients={};
@@ -48,74 +40,33 @@ export function maxBuyShare5m(buckets,minute) {
 
 /**
  * Creator net-sell / balance. Always UNKNOWN when only creator address is passed
- * (net sell + balance not verifiable) — incomplete placeholder, not a full metric.
+ * (net sell + balance not verifiable) - incomplete placeholder, not a full metric.
  */
 export function creatorNetSellRatio({creator=null,netSellUsd=null,balanceUsd=null,balanceRaw=null}={}) {
   if(!creator) return {
     status:'UNKNOWN',value:null,source:evidence('pools/holders'),
-    complete:false,note:'Creator unknown — PLACEHOLDER/unavailable; not fabricated',
+    complete:false,note:'Creator unknown - PLACEHOLDER/unavailable; not fabricated',
   };
   if(netSellUsd==null||!Number.isFinite(netSellUsd)) return {
     status:'UNKNOWN',value:null,creator,source:evidence('swap_events'),
     complete:false,
-    note:'INCOMPLETE: only creator passed (or sells unverifiable) — always UNKNOWN until deployer+sells+balance plumbed',
+    note:'INCOMPLETE: only creator passed (or sells unverifiable) - always UNKNOWN until deployer+sells+balance plumbed',
   };
   if(balanceRaw===0n||balanceRaw==='0') return {
     status:'OBSERVED',value:null,creator,net_sell_usd:netSellUsd,balance:0,complete:true,
-    note:'Balance zero — ratio undefined',source:evidence('holderData'),
+    note:'Balance zero - ratio undefined',source:evidence('holderData'),
   };
   const bal=balanceUsd;
   if(bal==null) return {
     status:'UNKNOWN',value:null,creator,source:evidence('holderData'),complete:false,
-    note:'Creator balance unknown — PLACEHOLDER/unavailable',
+    note:'Creator balance unknown - PLACEHOLDER/unavailable',
   };
   if(!(bal>0)) return {
     status:'OBSERVED',value:null,creator,net_sell_usd:netSellUsd,balance:bal,complete:true,
-    note:'Non-positive balance — ratio undefined',source:evidence('holderData'),
+    note:'Non-positive balance - ratio undefined',source:evidence('holderData'),
   };
   return {
     status:'OBSERVED',value:netSellUsd/bal,creator,net_sell_usd:netSellUsd,balance:bal,
     threshold:null,complete:true,source:evidence('swap_events+holderData'),note:'Observe-only',
-  };
-}
-
-/**
- * Quote loss breakdown. Quoter fee+impact are merged when inseparable.
- * Haircut is tracked separately (JSON-safe Number/string) — merged label discloses this.
- */
-export function quoteLossBreakdown(plan) {
-  if(!plan) return {
-    status:'UNKNOWN',parts:null,complete:false,
-    note:'No plan quotes available — rejection paths without plan lack fee/impact evidence',
-  };
-  const haircutRaw=plan.haircut_bps!=null?plan.haircut_bps:HAIRCUT_BPS;
-  const haircutSafe=asJsonNumberOrString(haircutRaw);
-  const parts={
-    quoter_fee_and_impact_merged:{
-      status:plan.buy&&plan.sell?'OBSERVED':'UNKNOWN',value:null,
-      includes_haircut:false,
-      haircut_tracked_separately:true,
-      note:'MERGED LABEL: quoter embeds fee+impact (inseparable). Does NOT include execution haircut_bps (listed separately). Total round-trip loss includes haircut+gas.',
-    },
-    haircut_bps:{
-      status:haircutSafe!=null?'OBSERVED':'UNKNOWN',
-      value:haircutSafe,
-      note:'JSON-safe Number/string (never raw BigInt)',
-    },
-    buy_gas_usd:{status:Number.isFinite(plan.buyGas)?'OBSERVED':'UNKNOWN',value:plan.buyGas??null},
-    sell_gas_usd:{status:Number.isFinite(plan.sellGas)?'OBSERVED':'UNKNOWN',value:plan.sellGas??null},
-    l1_allowance:{status:'UNKNOWN',value:null,note:'L1 allowance not isolated in paper plan — PLACEHOLDER/unavailable'},
-    total_round_trip_loss_usd:{status:Number.isFinite(plan.loss)?'OBSERVED':'UNKNOWN',value:plan.loss??null},
-    total_round_trip_loss_pct:{status:Number.isFinite(plan.loss_pct)?'OBSERVED':'UNKNOWN',value:plan.loss_pct??null},
-  };
-  if(Number.isFinite(plan.initial)&&Number.isFinite(plan.recovered)&&Number.isFinite(plan.buyGas)&&Number.isFinite(plan.sellGas)) {
-    const sellUsd=plan.recovered+plan.sellGas, principal=plan.initial-plan.buyGas;
-    parts.quoter_fee_and_impact_merged.value=Number.isFinite(sellUsd)?principal-sellUsd:null;
-    parts.quoter_fee_and_impact_merged.status=parts.quoter_fee_and_impact_merged.value==null?'UNKNOWN':'OBSERVED';
-  }
-  return {
-    status:'OBSERVED',parts,complete:true,
-    source:evidence('plannedRoundTripFromQuotes',{haircut_bps:asJsonNumberOrString(HAIRCUT_BPS)}),
-    note:'Nominal pool.liquidity is not USD depth; observe-only. Merged fee+impact excludes haircut (disclosed).',
   };
 }

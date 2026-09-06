@@ -1,20 +1,20 @@
-/** GROK_SCREENING_V1 — screening schema, checks, funnel, merge. */
+/** GROK_SCREENING_V1 - screening schema, checks, funnel, merge. */
 import {CODE_VERSION} from './abc-collect.mjs';
 import {zeroAddress} from 'viem';
 import {
   NO_T_DETAIL,diagnoseTargetMinute,mapFxReason,fxStatusFromDiag,evidence,
 } from './abc-screening-not.mjs';
 import {
-  attributedBuyRecipients,maxBuyShare5m,creatorNetSellRatio,quoteLossBreakdown,
+  attributedBuyRecipients,maxBuyShare5m,creatorNetSellRatio,quoteLossBreakdown,dualTop10Concentration,
 } from './abc-screening-risk.mjs';
 
-export const SCREENING_VERSION='screening-v1';
+export const SCREENING_VERSION='screening-v1-p0';
 export {
   NO_T_DETAIL,diagnoseTargetMinute,mapFxReason,fxStatusFromDiag,
-  attributedBuyRecipients,maxBuyShare5m,creatorNetSellRatio,quoteLossBreakdown,
+  attributedBuyRecipients,maxBuyShare5m,creatorNetSellRatio,quoteLossBreakdown,dualTop10Concentration,
 };
 
-/** BigInt-safe JSON — plain JSON.stringify throws on haircut_bps / liquidity BigInts. */
+/** BigInt-safe JSON - plain JSON.stringify throws on haircut_bps / liquidity BigInts. */
 export function jsonSafe(value) {
   return JSON.stringify(value,(_,v)=>typeof v==='bigint'?v.toString():v);
 }
@@ -48,9 +48,14 @@ export function buildSafetyChecks({pool,holders=null,holdersError=null,roundTrip
   if(holdersError) {
     push('holder_count',null,15,'UNKNOWN',String(holdersError),'holderData',{missing:true});
     push('top10_circulating_bps',null,6000,'UNKNOWN',String(holdersError),'holderData',{missing:true});
+    const dual=dualTop10Concentration(null,{holdersError});
+    push('top10_raw',null,null,'UNKNOWN',String(holdersError),'holderData',{diagnose_only:true,missing:true,gate_unchanged:true});
+    push('top10_ex_lp',null,null,'UNKNOWN',String(holdersError),'holderData',{diagnose_only:true,missing:true,gate_unchanged:true,lp_exclusion:dual.lp_exclusion});
   } else if(!holders) {
     push('holder_count',null,15,'UNKNOWN','HOLDERS_NOT_FETCHED','holderData',{missing:true});
     push('top10_circulating_bps',null,6000,'UNKNOWN','HOLDERS_NOT_FETCHED','holderData',{missing:true});
+    push('top10_raw',null,null,'UNKNOWN','HOLDERS_NOT_FETCHED','holderData',{diagnose_only:true,missing:true,gate_unchanged:true});
+    push('top10_ex_lp',null,null,'UNKNOWN','HOLDERS_NOT_FETCHED','holderData',{diagnose_only:true,missing:true,gate_unchanged:true});
   } else {
     const hc=holders.holder_count;
     if(hc==null) push('holder_count',null,15,'UNKNOWN','HOLDER_COUNT_MISSING','holders.summary');
@@ -60,6 +65,15 @@ export function buildSafetyChecks({pool,holders=null,holdersError=null,roundTrip
     else push('top10_circulating_bps',t10,6000,t10<=6000?'PASS':'FAIL',
       t10<=6000?'ok':'TOP10_OVER_60_PERCENT_CIRCULATING','holders.summary.top10_circulating_bps',
       {denominator:'circulating_ex_infra',total_supply_bps:holders.top10_total_supply_bps??null});
+    // Additive diagnose-only dual top10 (gate above unchanged)
+    const dual=dualTop10Concentration(holders);
+    push('top10_raw',dual.top10_raw.value_bps,null,dual.top10_raw.status,
+      dual.top10_raw.reason||'ok','holders.summary.top10_raw',
+      {diagnose_only:true,denominator:dual.top10_raw.denominator,note:dual.top10_raw.note,
+        includes_lp:dual.top10_raw.includes_lp===true,gate_unchanged:true});
+    push('top10_ex_lp',dual.top10_ex_lp.value_bps,null,dual.top10_ex_lp.status,
+      dual.top10_ex_lp.reason||'ok','holders.summary.top10_ex_lp',
+      {diagnose_only:true,denominator:dual.top10_ex_lp.denominator,note:dual.top10_ex_lp.note,gate_unchanged:true});
   }
   if(roundTrip==null) push('round_trip_loss_pct',null,0.05,'UNKNOWN','ROUND_TRIP_NOT_RUN','plannedRoundTrip');
   else if(roundTrip.loss_pct==null||!Number.isFinite(roundTrip.loss_pct)) push('round_trip_loss_pct',null,0.05,'UNKNOWN','LOSS_PCT_UNKNOWN','plannedRoundTrip');
@@ -77,7 +91,12 @@ export function finalizeQuoteCheck(checks,pool,usdg) {
   return checks;
 }
 
-/** Funnel stage: graduation-age ≠ data/window warmups. */
+/**
+ * Funnel stage: graduation-age != data warmups != consecutive-minute OBSERVING.
+ * P0: OBSERVING = consecutive-minute / post-graduation observation window incomplete
+ *     (WARMUP_LT_30_CONSECUTIVE, WINDOW_INCOMPLETE) - distinct from AGE and DATA_INCOMPLETE.
+ * WARMUP != AGE (PR1); OBSERVING != AGE (P0).
+ */
 export function classifyFunnelStage({watched,diag,ev,gradTs,minute,safetyOk,paperFilled}) {
   if(!watched) return 'NOT_OBSERVED';
   if(paperFilled) return 'PAPER_FILL';
@@ -86,7 +105,11 @@ export function classifyFunnelStage({watched,diag,ev,gradTs,minute,safetyOk,pape
   if(ev?.signal) return 'STRATEGY_SIGNAL';
   const reason=ev?.reason!=null?String(ev.reason):'';
   if(reason==='GRADUATION_TIME_UNKNOWN'||reason.startsWith('WARMUP_GRADUATION')) return 'AGE_INCOMPLETE';
-  if(reason==='WARMUP'||reason==='WARMUP_LT_120M'||reason==='WARMUP_LT_30_CONSECUTIVE'||reason==='WINDOW_INCOMPLETE')
+  // Consecutive-minute / observation-window incomplete -> explicit OBSERVING stage
+  if(reason==='WARMUP_LT_30_CONSECUTIVE'||reason==='WINDOW_INCOMPLETE'||reason==='OBSERVING')
+    return 'OBSERVING';
+  // Generic history/data warmups (not graduation age, not observation window)
+  if(reason==='WARMUP'||reason==='WARMUP_LT_120M')
     return 'DATA_INCOMPLETE';
   if(reason==='NO_T'||(diag&&diag.detail_code&&diag.filter_reject)) return 'DATA_INCOMPLETE';
   if(gradTs==null) return 'AGE_INCOMPLETE';
@@ -95,7 +118,7 @@ export function classifyFunnelStage({watched,diag,ev,gradTs,minute,safetyOk,pape
 }
 
 const FUNNEL_RANK=Object.freeze({
-  NOT_OBSERVED:0,OBSERVED:1,DATA_INCOMPLETE:2,AGE_INCOMPLETE:2,
+  NOT_OBSERVED:0,OBSERVED:1,DATA_INCOMPLETE:2,AGE_INCOMPLETE:2,OBSERVING:2,
   NO_STRATEGY_SIGNAL:3,STRATEGY_SIGNAL:4,SAFETY_FAIL:5,SAFETY_PASS:6,PAPER_FILL:7,
 });
 

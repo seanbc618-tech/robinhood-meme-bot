@@ -1,7 +1,7 @@
 /** GROK_SCREENING_V1 — screening upsert / recordEval. */
 import {CODE_VERSION} from './abc-collect.mjs';
 import {diagnoseTargetMinute,evidence} from './abc-screening-not.mjs';
-import {maxBuyShare5m,creatorNetSellRatio,quoteLossBreakdown} from './abc-screening-risk.mjs';
+import {maxBuyShare5m,creatorNetSellRatio,quoteLossBreakdown,dualTop10Concentration} from './abc-screening-risk.mjs';
 import {
   SCREENING_VERSION,ensureScreeningSchema,jsonSafe,buildSafetyChecks,classifyFunnelStage,mergeScreeningEvalRow,
 } from './abc-screening-funnel.mjs';
@@ -60,13 +60,16 @@ export function recordEvalFromCycle(store,{strategy,token,minute,ev,gradTs,watch
   else if(ev?.reason==='WINDOW_INCOMPLETE') detail_code='WINDOW_INCOMPLETE';
   else if(ev?.reason&&String(ev.reason).startsWith('WARMUP')) detail_code=ev.reason;
   else if(ev?.reason) detail_code=ev.reason;
+  const holdersSummary=safety?.holders||null;
   const risk={
     max_buy_share_5m:maxBuyShare5m(buckets,minute),
     creator_net_sell:creatorNetSellRatio({creator:pool?.deployer||null}),
     quote_loss:quoteLossBreakdown(safety?.plan||null),
+    dual_top10:dualTop10Concentration(holdersSummary,{holdersError:safety?.error||null}),
     metrics_scope:{
       creator_net_sell:'PLACEHOLDER_UNTIL_DEPLOYER_AND_SELLS — UNKNOWN if only creator address passed',
       quote_loss_fee_impact:'MERGED_LABEL — quoter fee+impact inseparable; haircut listed separately',
+      dual_top10:'DIAGNOSE_ONLY — top10_raw + top10_ex_lp; gate still top10_circulating_bps@6000',
       rejection_path_evidence:safety?.plan||safety?.checks?'present_when_tryEnter_returns_safety_or_plan':'unavailable_on_paths_without_plan',
     },
   };
