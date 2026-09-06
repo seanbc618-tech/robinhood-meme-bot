@@ -25,8 +25,23 @@ export async function safetyScreen(store,pool,block,rates) {
     if(holders.summary.holder_count<15) reasons.push('FEWER_THAN_15_HOLDERS');
     if(holders.summary.top10_circulating_bps>6000) reasons.push('TOP10_OVER_60_PERCENT_CIRCULATING');
   }
-  const checks=buildSafetyEvidence(pool,holders&&holders.summary,holdersError);
-  return {ok:!reasons.length,reasons,holders:holders?holders.summary:null,checks};
+  // Diagnose-only: attach lp_exclusion + dual aliases when infrastructure set is present.
+  let summary=holders?{...holders.summary}:null;
+  if(summary&&holders.infrastructure instanceof Set&&!summary.lp_exclusion) {
+    summary.lp_exclusion={status:'OBSERVED',excluded_count:holders.infrastructure.size,
+      addresses:[...holders.infrastructure],
+      note:'LP/infra from holderData.infrastructure (zeroAddress+manager+router+hook+locker+curve+factory+permit2)'};
+    if(summary.top10_ex_lp_circulating_bps==null) summary.top10_ex_lp_circulating_bps=summary.top10_circulating_bps??null;
+    if(summary.top10_ex_lp_total_supply_bps==null) summary.top10_ex_lp_total_supply_bps=summary.top10_total_supply_bps??null;
+    // True raw-with-LP needs balances; until chain.mjs emits top10_raw_*, fall back honestly.
+    if(summary.top10_raw_total_supply_bps==null&&summary.top10_total_supply_bps!=null) {
+      summary.top10_raw_total_supply_bps=summary.top10_total_supply_bps;
+      summary.top10_raw_includes_lp=false;
+      summary.top10_raw_note='Fallback ex-infra/total_supply; true raw-with-LP awaits chain.mjs additive field';
+    }
+  }
+  const checks=buildSafetyEvidence(pool,summary,holdersError);
+  return {ok:!reasons.length,reasons,holders:summary,checks};
 }
 
 /** Diagnose-only numeric evidence for safety gates. unknown!=0!=PASS. */
