@@ -1,5 +1,14 @@
 --- a/abc.mjs
 +++ b/abc.mjs
+@@ -6,7 +6,7 @@
+ import {ROOT,A,client,save,failure} from './chain.mjs';
+ import {broadcast,enabled} from './telegram.mjs';
+ import {
+-  abcDir,openAbc,initAccounts,readAccount,writeAccount,readRun,writeRun,
++  abcDir,openAbc,openAbcReadonly,initAccounts,readAccount,writeAccount,readRun,writeRun,
+   syncCatalog,graduationTs,loadBuckets,bucketMap,takeWindow,uniqueRecipients,recipientShare,
+   enrichPool,collectBuckets,plannedRoundTrip,plannedRoundTripFromQuotes,netExitValue,
+   safetyScreen,requireRoundTrip,pickQueue,catalogStats,assertFreshness,quoteFresh,
 @@ -17,6 +17,9 @@
    pickLiveWatch,skipBacklogForLive,LIVE_WATCH_N,rpcTimeout,saveFxSnap,logBlocksNeeded,
    extendActiveWatchBounds,
@@ -10,7 +19,7 @@
  
  export function remainingFraction(p) {
    const q=BigInt(p.qty),i=BigInt(p.initialQty);
-@@ -409,7 +412,7 @@
+@@ -409,16 +412,16 @@
    if(account.seen.includes(token)) {count(account,'ALREADY_OWNED');writeAccount(store,account);return {skipped:'ALREADY_OWNED'};}
    if(Number(block.timestamp)<signal.minute+60) {count(account,'FILL_BEFORE_SIGNAL_COMPLETE');writeAccount(store,account);return {skipped:'FILL_BEFORE_SIGNAL_COMPLETE'};}
    const screen=await (io.safetyScreen||safetyScreen)(store,pool,block,rates);
@@ -19,6 +28,35 @@
    const principal=account.principal_limit;
    let plan;
    try {plan=await (io.plannedRoundTrip||plannedRoundTrip)(pool,principal,block,rates,gasPrice,HAIRCUT_BPS);}
+-  catch(error) {count(account,classifyError(error));writeAccount(store,account);return {skipped:failure(error)};}
+-  if(plan.cash_out>account.spend_limit) {count(account,'CASH_OUT_OVER_CAP');writeAccount(store,account);return {skipped:'CASH_OUT_OVER_CAP'};}
+-  if(account.cash-plan.cash_out<account.reserve) {count(account,'RESERVE_FLOOR');writeAccount(store,account);return {skipped:'RESERVE_FLOOR'};}
+-  if(!(plan.loss_pct<=0.05)) {count(account,'ROUND_TRIP_COST_OVER_5_PERCENT');writeAccount(store,account);return {skipped:'ROUND_TRIP_COST_OVER_5_PERCENT'};}
++  catch(error) {count(account,classifyError(error));writeAccount(store,account);return {skipped:failure(error),safety:{...screen,plan:null,checks:screen.checks||null}};}
++  if(plan.cash_out>account.spend_limit) {count(account,'CASH_OUT_OVER_CAP');writeAccount(store,account);return {skipped:'CASH_OUT_OVER_CAP',safety:screen,plan};}
++  if(account.cash-plan.cash_out<account.reserve) {count(account,'RESERVE_FLOOR');writeAccount(store,account);return {skipped:'RESERVE_FLOOR',safety:screen,plan};}
++  if(!(plan.loss_pct<=0.05)) {count(account,'ROUND_TRIP_COST_OVER_5_PERCENT');writeAccount(store,account);return {skipped:'ROUND_TRIP_COST_OVER_5_PERCENT',safety:{...screen,ok:false,checks:(screen.checks||[]).concat([{name:'round_trip_loss_pct',value:plan.loss_pct,threshold:0.05,status:'FAIL',reason:'ROUND_TRIP_COST_OVER_5_PERCENT',source:'plannedRoundTrip.loss_pct'}])},plan};}
+   const sim=await (io.requireRoundTrip||requireRoundTrip)(pool,plan.amountIn,block);
+-  if(!sim.ok) {count(account,sim.reason==='USDG_SIMULATION_REQUIRES_FUNDED_ACCOUNT'?sim.reason:'ROUND_TRIP_SIM_FAILED');writeAccount(store,account);return {skipped:sim.reason};}
++  if(!sim.ok) {count(account,sim.reason==='USDG_SIMULATION_REQUIRES_FUNDED_ACCOUNT'?sim.reason:'ROUND_TRIP_SIM_FAILED');writeAccount(store,account);return {skipped:sim.reason,safety:screen,plan};}
+   let stress={};
+   try {
+     if(io.stress) stress=io.stress;
+@@ -430,12 +433,12 @@
+   } catch {stress.incomplete=true;}
+   const commitAt=clock();
+   const stale=assertTradeFresh(block,rates,commitAt);
+-  if(stale) {count(account,stale);writeAccount(store,account);return {skipped:stale};}
++  if(stale) {count(account,stale);writeAccount(store,account);return {skipped:stale,safety:screen,plan};}
+   const ok=applyBuy(account,{token,qty:plan.qty,cost:plan.cash_out,block:block.number,signal_ts:signal.minute,
+     signal_block:signal.block,decision_ts:now,quote_block:block.number,fill_ts:commitAt,reason:'entry',
+     plan:{loss_pct:plan.loss_pct,buy_gas:plan.buyGas,sell_gas:plan.sellGas,haircut_bps:50,stress,simulation:sim.sim?.status},
+     version:STRATEGY_VERSION});
+-  if(!ok) {count(account,'APPLY_BUY_REJECTED');writeAccount(store,account);return {skipped:'APPLY_BUY_REJECTED'};}
++  if(!ok) {count(account,'APPLY_BUY_REJECTED');writeAccount(store,account);return {skipped:'APPLY_BUY_REJECTED',safety:screen,plan};}
+   account.used_signals.push(sid);
+   try {
+     const marked=await quoteNet(pool,plan.qty,block,rates,gasPrice);
 @@ -445,7 +448,7 @@
    recomputeEquity(account);
    applyDayBaseline(account,commitAt);
@@ -74,9 +112,9 @@
 -  else throw new Error('Usage: node abc.mjs start [hours] | run [hours] | status | stop | report');
 -}
 +  else if(cmd==='screening-report') {
-+    const store=openAbc(dir);
++    const store=openAbcReadonly(dir);
 +    try {
-+      ensureScreeningSchema(store);
++      // Read-only: no ensure schema / migrations / init
 +      const rep=screeningReport(store,{readOnly:true});
 +      console.log(stringify(rep));
 +    } finally {store.close();}
