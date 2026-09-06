@@ -1,7 +1,7 @@
 /** GROK_SCREENING_V1 — read-only screening report. */
 import {CODE_VERSION} from './abc-collect.mjs';
 import {NO_T_DETAIL} from './abc-screening-not.mjs';
-import {SCREENING_VERSION} from './abc-screening-core.mjs';
+import {SCREENING_VERSION} from './abc-screening-funnel.mjs';
 
 function emptyFunnel() {
   return {unique_evals:0,observed:0,data_complete:0,age_ok:0,age_incomplete:0,strategy_signal:0,safety_pass:0,safety_fail:0,paper_fill:0,no_t_aggregate:0,data_or_age_block:0,
