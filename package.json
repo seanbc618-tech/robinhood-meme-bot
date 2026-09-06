@@ -1,0 +1,13 @@
+{
+  "name": "robinhood-dog-bot",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "dependencies": {
+    "viem": "2.56.3",
+    "@uniswap/v4-sdk": "2.3.3"
+  },
+  "license": "MIT"
+}
