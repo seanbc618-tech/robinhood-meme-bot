@@ -1,11 +1,12 @@
 import {zeroAddress} from 'viem';
 import {A,failure,holderData} from './chain.mjs';
 import {classifyError} from './abc-collect.mjs';
+import {dualTop10Concentration} from './abc-screening-risk.mjs';
 
 export async function safetyScreen(store,pool,block,rates) {
   const reasons=[];
   // Cheap checks first (phase / liquidity / quote). Heavy holderData only after those pass
-  // when a real entry path invokes this — same order as before for buy gating.
+  // when a real entry path invokes this - same order as before for buy gating.
   if(pool.launch.phase!==2) reasons.push('NOT_PHASE2');
   if(!(pool.liquidity>0n&&pool.sqrtPriceX96>0n)) reasons.push('NO_LIQUIDITY');
   const quote=pool.quote.toLowerCase();
@@ -28,7 +29,7 @@ export async function safetyScreen(store,pool,block,rates) {
   return {ok:!reasons.length,reasons,holders:holders?holders.summary:null,checks};
 }
 
-/** Diagnose-only numeric evidence for safety gates. unknown≠0≠PASS. */
+/** Diagnose-only numeric evidence for safety gates. unknown!=0!=PASS. */
 export function buildSafetyEvidence(pool,holdersSummary,holdersError) {
   const checks=[];
   const push=(name,value,threshold,status,reason,source,extra={})=>
@@ -53,9 +54,13 @@ export function buildSafetyEvidence(pool,holdersSummary,holdersError) {
   if(holdersError) {
     push('holder_count',null,15,'UNKNOWN',String(holdersError),'holderData',{missing:true});
     push('top10_circulating_bps',null,6000,'UNKNOWN',String(holdersError),'holderData',{missing:true});
+    push('top10_raw',null,null,'UNKNOWN',String(holdersError),'holderData',{diagnose_only:true,missing:true,gate_unchanged:true});
+    push('top10_ex_lp',null,null,'UNKNOWN',String(holdersError),'holderData',{diagnose_only:true,missing:true,gate_unchanged:true});
   } else if(!holdersSummary) {
     push('holder_count',null,15,'UNKNOWN','HOLDERS_NOT_FETCHED','holderData',{missing:true});
     push('top10_circulating_bps',null,6000,'UNKNOWN','HOLDERS_NOT_FETCHED','holderData',{missing:true});
+    push('top10_raw',null,null,'UNKNOWN','HOLDERS_NOT_FETCHED','holderData',{diagnose_only:true,missing:true,gate_unchanged:true});
+    push('top10_ex_lp',null,null,'UNKNOWN','HOLDERS_NOT_FETCHED','holderData',{diagnose_only:true,missing:true,gate_unchanged:true});
   } else {
     const hc=holdersSummary.holder_count;
     if(hc==null) push('holder_count',null,15,'UNKNOWN','HOLDER_COUNT_MISSING','holders.summary');
@@ -65,6 +70,13 @@ export function buildSafetyEvidence(pool,holdersSummary,holdersError) {
     else push('top10_circulating_bps',t10,6000,t10<=6000?'PASS':'FAIL',
       t10<=6000?'ok':'TOP10_OVER_60_PERCENT_CIRCULATING','holders.summary.top10_circulating_bps',
       {denominator:'circulating_ex_infra',total_supply_bps:holdersSummary.top10_total_supply_bps??null});
+    const dual=dualTop10Concentration(holdersSummary);
+    push('top10_raw',dual.top10_raw.value_bps,null,dual.top10_raw.status,
+      dual.top10_raw.reason||'ok','holders.summary.top10_raw',
+      {diagnose_only:true,denominator:dual.top10_raw.denominator,note:dual.top10_raw.note,gate_unchanged:true});
+    push('top10_ex_lp',dual.top10_ex_lp.value_bps,null,dual.top10_ex_lp.status,
+      dual.top10_ex_lp.reason||'ok','holders.summary.top10_ex_lp',
+      {diagnose_only:true,denominator:dual.top10_ex_lp.denominator,note:dual.top10_ex_lp.note,gate_unchanged:true});
   }
   push('round_trip_loss_pct',null,0.05,'UNKNOWN','ROUND_TRIP_DEFERRED_UNTIL_ENTRY','tryEnter.plannedRoundTrip',
     {note:'Heavy holderData/sim only on real entry signal path; not run during collect'});
