@@ -1,14 +1,17 @@
-import {mkdtempSync,rmSync} from 'node:fs';
+import {mkdtempSync,rmSync,writeFileSync,existsSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {zeroAddress} from 'viem';
-import {openAbc,CODE_VERSION,minuteStart} from './abc-collect.mjs';
+import {openAbc,CODE_VERSION,minuteStart,HAIRCUT_BPS} from './abc-collect.mjs';
+import {openAbcReadonly} from './abc-collect-readonly.mjs';
 import {evaluateA} from './abc.mjs';
 import {
   diagnoseTargetMinute,screeningReport,ensureScreeningSchema,
   attributedBuyRecipients,fxStatusFromDiag,buildSafetyChecks,NO_T_DETAIL,
-  recordEvalFromCycle,
+  recordEvalFromCycle,classifyFunnelStage,quoteLossBreakdown,jsonSafe,
+  upsertScreeningEval,creatorNetSellRatio,mergeScreeningEvalRow,
 } from './abc-screening.mjs';
+import {runPr1Regressions} from './abc-screening-verify-pr1.mjs';
 
 const failures=[];
 function assert(name,ok,detail){if(ok) console.log('PASS',name); else {console.log('FAIL',name,detail||'');failures.push(name);}}
@@ -55,8 +58,10 @@ function bar(minute,c,extra={}){const r=extra.buy_recipients||{};return{minute,o
     const hc=checks.find(c=>c.name==='holder_count');
     assert('holder unknown is UNKNOWN not 0 PASS',hc&&hc.status==='UNKNOWN'&&hc.value==null,hc);
     const beforeBuckets=store.db.prepare('SELECT count(*) c FROM buckets').get().c;
+    const beforeTables=store.db.prepare(`SELECT count(*) c FROM sqlite_master WHERE type='table'`).get().c;
     const rep=screeningReport(store,{readOnly:true});
     assert('screening-report does not modify buckets',beforeBuckets===store.db.prepare('SELECT count(*) c FROM buckets').get().c);
+    assert('screening-report does not create tables',beforeTables===store.db.prepare(`SELECT count(*) c FROM sqlite_master WHERE type='table'`).get().c,beforeTables);
     assert('report has A/B/C funnel',rep.strategies.A&&rep.strategies.B&&rep.strategies.C,rep.strategies);
     store.close();
   } finally {rmSync(dir,{recursive:true,force:true});}
@@ -78,6 +83,8 @@ function bar(minute,c,extra={}){const r=extra.buy_recipients||{};return{minute,o
   assert('screening v1 did not change A trigger',!!ev.signal&&ev.signal.strategy==='A',ev);
   assert('NO_T aggregate reason preserved',evaluateA([],null,gradA,t0).reason==='NO_T');
 }
+
+runPr1Regressions(assert);
 
 assert('verify did not touch data/abc sqlite',!process.env.ABC_HOME);
 if(failures.length){console.error('FAILED',failures.length,failures.join(','));process.exitCode=1;}
