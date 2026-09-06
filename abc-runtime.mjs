@@ -41,14 +41,26 @@ export function releaseLock(dir) {
 
 function notifySafe(run,key,text) {
   return (async()=>{
-    if(!/^(fill:|halt:)/.test(key)||!enabled()) return {skipped:true};
+    if(!/^(fill:|halt:|hourly-holdings:)/.test(key)||!enabled()) return {skipped:true};
     try {return await broadcast('abc:'+key,text);}
     catch(e) {run.telegram_error=failure(e);return {error:failure(e)};}
   })();
 }
 
 function accountSummary(a) {
-  return `${a.strategy}: cash=${a.cash.toFixed(2)} equity=${a.equity==null?'null':a.equity.toFixed(2)} realized=${a.realized.toFixed(4)} pos=${a.positions.length} halt=${a.halted_permanent?'perm':a.halted_day?'day':'no'}`;
+  const money=v=>v==null?'不可用':Number(v).toFixed(2);
+  return `策略 ${a.strategy}：现金 ${money(a.cash)}，净值 ${money(a.equity)} USD\n已实现 ${money(a.realized)}，浮动 ${money(a.unrealized)}；持仓 ${a.positions.length}，熔断 ${a.halted_permanent?'累计':a.halted_day?'当日':'无'}\n`+
+    (a.positions.length?a.positions.map(p=>`${p.token}：估值 ${money(p.mark)} USD`).join('\n'):'当前空仓');
+}
+
+export async function notifyHourlyHoldings(store,run) {
+  const hour=new Date().toISOString().slice(0,13);
+  if(run.last_holdings_hour===hour) return;
+  const accs=['A','B','C'].map(s=>readAccount(store,s));
+  const result=await notifySafe(run,`hourly-holdings:${run.started_at}:${hour}`,
+    `📊 ABC 每小时持仓（纸面模拟，非实盘）\n报告时间：${new Date().toISOString()}\n状态：${run.status}\n最近完成轮：${run.last_completed_at?new Date(run.last_completed_at).toISOString():'尚无'}\n${accs.map(accountSummary).join('\n\n')}`);
+  if(result?.message_id||result?.duplicate) run.last_holdings_hour=hour;
+  writeRun(store,run);
 }
 
 function reportFromAccounts(accounts,run,catalog) {
@@ -268,11 +280,6 @@ export async function worker(hours,foreground=false) {
           const key=`src:${run.last_pool_error.kind}:${String(run.last_pool_error.error).slice(0,40)}`;
           await notifySafe(run,key,`⚠️ ABC PAPER 源故障变化\n${run.last_pool_error.kind}\n${run.last_pool_error.error}\n本轮不伪造K线或成交。`);
         }
-        const hour=new Date().toISOString().slice(0,13);
-        if(run.rounds===1||run.last_summary_hour!==hour) {
-          await notifySafe(run,`hour:${hour}`,`📊 ABC PAPER 每小时摘要（非实盘）\n轮次：${run.rounds} 失败轮：${run.failed_rounds||0}\n覆盖：分析${run.analyzed}/${run.catalog?.supported||0} 池（上限${ANALYZE_LIMIT}）\n${accs.map(accountSummary).join('\n')}\n未执行实盘。`);
-          run.last_summary_hour=hour;writeRun(store,run);
-        }
       } catch(error) {
         const kind=classifyError(error);
         store.bump(kind);
@@ -291,6 +298,7 @@ export async function worker(hours,foreground=false) {
         if(run.prev_error!==run.last_error) await notifySafe(run,`err:${run.failed_rounds}`,`⚠️ ABC PAPER 本轮失败（非实盘）\n${kind}\n${run.last_error}\n净值置 null，不伪造行情。`);
         run.prev_error=run.last_error;writeRun(store,run);
       }
+      await notifyHourlyHoldings(store,run);
       const next=Math.min(nextTickDeadline(tickStart),run.ends_at);
       await sleepUntil(next,()=>stopping||existsSync(resolve(dir,'stop.json')),200);
     }
