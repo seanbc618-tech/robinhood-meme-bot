@@ -49,6 +49,9 @@ let backupLogsUntil=0;
 let solidDisabledUntil=0;
 const ALCHEMY_LOG_CHUNK=10n;
 const ALCHEMY_MAX_FALLBACK_RANGE=900n;
+const PUBLIC_LOG_MIN_INTERVAL_MS=150;
+const ALCHEMY_LOG_RETRIES=2;
+let publicNextAt=0;
 export const logRpcHealth={public_failures:0,backup_successes:0,alchemy_successes:0,solid_quota_exhausted:0,last_failure:null,last_provider:null};
 function errorText(error) {
   return [error?.message,error?.shortMessage,error?.details,error?.cause?.message]
@@ -66,11 +69,28 @@ function noteLogFailure(provider,error,args) {
   const p=args.params?.[0]||{};
   logRpcHealth.last_failure={provider,method:args.method,from:p.fromBlock,to:p.toBlock,address:p.address,at:Date.now(),code:error.code??error.cause?.code??null,error:safeErrorText(error)};
 }
+async function publicLogRequest(args) {
+  const wait=Math.max(0,publicNextAt-Date.now());
+  if(wait>0) await new Promise(resolve=>setTimeout(resolve,wait));
+  publicNextAt=Date.now()+PUBLIC_LOG_MIN_INTERVAL_MS;
+  return logTransport.request(args);
+}
+async function alchemyChunkRequest(args) {
+  let last;
+  for(let attempt=0;attempt<=ALCHEMY_LOG_RETRIES;attempt++) {
+    try { return await alchemyLogTransport.request(args); }
+    catch(error) {
+      last=error;
+      if(attempt<ALCHEMY_LOG_RETRIES) await new Promise(resolve=>setTimeout(resolve,250*(attempt+1)));
+    }
+  }
+  throw last||new Error('ALCHEMY_LOG_UNAVAILABLE');
+}
 async function alchemyLogRequest(args) {
   if(!alchemyLogTransport) throw new Error('ALCHEMY_LOG_UNAVAILABLE');
   const params=args.params||[];
   const filter=params[0]||{};
-  if(filter.fromBlock==null||filter.toBlock==null) return alchemyLogTransport.request(args);
+  if(filter.fromBlock==null||filter.toBlock==null) return alchemyChunkRequest(args);
   const from=BigInt(filter.fromBlock),to=BigInt(filter.toBlock);
   if(to<from) return [];
   if(to-from+1n>ALCHEMY_MAX_FALLBACK_RANGE) throw new Error('ALCHEMY_LOG_RANGE_TOO_LARGE');
@@ -78,7 +98,8 @@ async function alchemyLogRequest(args) {
   for(let lo=from;lo<=to;lo+=ALCHEMY_LOG_CHUNK) {
     const hi=lo+ALCHEMY_LOG_CHUNK-1n<to?lo+ALCHEMY_LOG_CHUNK-1n:to;
     const chunk={...filter,fromBlock:`0x${lo.toString(16)}`,toBlock:`0x${hi.toString(16)}`};
-    out.push(...await alchemyLogTransport.request({...args,params:[chunk,...params.slice(1)]}));
+    if(lo!==from) await new Promise(resolve=>setTimeout(resolve,120));
+    out.push(...await alchemyChunkRequest({...args,params:[chunk,...params.slice(1)]}));
   }
   return out;
 }
@@ -87,7 +108,7 @@ async function logRequest(args) {
   const preferSolid=backupLogTransport&&now<backupLogsUntil&&now>=solidDisabledUntil;
   const providers=[];
   if(preferSolid) providers.push(['solid',backupLogTransport]);
-  providers.push(['public',logTransport]);
+  providers.push(['public',{request:publicLogRequest}]);
   if(!preferSolid&&backupLogTransport&&now>=solidDisabledUntil) providers.push(['solid',backupLogTransport]);
   if(alchemyLogTransport) providers.push(['alchemy',{request:alchemyLogRequest}]);
   let last;
