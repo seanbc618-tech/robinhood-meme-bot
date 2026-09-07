@@ -19,7 +19,7 @@ try {
     const at=line.indexOf('=');
     if(at>0 && !line.startsWith('#')) {
       const key=line.slice(0,at).trim();
-      if(['ROBINHOOD_RPC_URL','ROBINHOOD_LOG_RPC_URL','ROBINHOOD_TRACE_RPC_URL','ROBINHOOD_WALLET'].includes(key)
+      if(['ROBINHOOD_RPC_URL','ROBINHOOD_LOG_RPC_URL','ROBINHOOD_LOG_RPC_URLS','ROBINHOOD_TRACE_RPC_URL','ROBINHOOD_WALLET'].includes(key)
         && process.env[key]===undefined) process.env[key]=line.slice(at+1).trim();
     }
   }
@@ -52,7 +52,21 @@ const ALCHEMY_MAX_FALLBACK_RANGE=900n;
 const PUBLIC_LOG_MIN_INTERVAL_MS=150;
 const ALCHEMY_LOG_RETRIES=2;
 let publicNextAt=0;
-export const logRpcHealth={public_failures:0,backup_successes:0,alchemy_successes:0,solid_quota_exhausted:0,last_failure:null,last_provider:null};
+function extraLogConfig() {
+  return String(process.env.ROBINHOOD_LOG_RPC_URLS||'').split(',').map((item,index)=>{
+    const at=item.indexOf('|');
+    const label=(at>0?item.slice(0,at):`extra${index+1}`).trim();
+    const url=(at>0?item.slice(at+1):item).trim();
+    if(!/^https?:\/\//i.test(url)) return null;
+    const lower=label.toLowerCase();
+    return {label,url,intervalMs:lower.includes('quick')?1200:1000};
+  }).filter(Boolean);
+}
+const extraLogTransports=extraLogConfig().map(entry=>({...entry,
+  transport:http(entry.url,{retryCount:0,timeout:10000,fetchOptions:{headers:{'User-Agent':'rh-dog-bot/0.2'}}})({}),
+  nextAt:0,
+}));
+export const logRpcHealth={public_failures:0,backup_successes:0,alchemy_successes:0,slow_successes:0,solid_quota_exhausted:0,last_failure:null,last_provider:null};
 function errorText(error) {
   return [error?.message,error?.shortMessage,error?.details,error?.cause?.message]
     .filter(Boolean).join(' ') || String(error);
@@ -103,6 +117,12 @@ async function alchemyLogRequest(args) {
   }
   return out;
 }
+async function extraLogRequest(entry,args) {
+  const wait=Math.max(0,entry.nextAt-Date.now());
+  if(wait>0) await new Promise(resolve=>setTimeout(resolve,wait));
+  entry.nextAt=Date.now()+entry.intervalMs;
+  return entry.transport.request(args);
+}
 async function logRequest(args) {
   const now=Date.now();
   const preferSolid=backupLogTransport&&now<backupLogsUntil&&now>=solidDisabledUntil;
@@ -110,13 +130,17 @@ async function logRequest(args) {
   if(preferSolid) providers.push(['solid',backupLogTransport]);
   providers.push(['public',{request:publicLogRequest}]);
   if(!preferSolid&&backupLogTransport&&now>=solidDisabledUntil) providers.push(['solid',backupLogTransport]);
-  if(alchemyLogTransport) providers.push(['alchemy',{request:alchemyLogRequest}]);
+  for(const entry of extraLogTransports) providers.push([entry.label,{request:args=>extraLogRequest(entry,args)}]);
+  const p=args.params?.[0]||{};
+  const range=p.fromBlock!=null&&p.toBlock!=null?BigInt(p.toBlock)-BigInt(p.fromBlock)+1n:null;
+  if(alchemyLogTransport&&(range==null||range<=ALCHEMY_MAX_FALLBACK_RANGE)) providers.push(['alchemy',{request:alchemyLogRequest}]);
   let last;
   for(const [provider,transport] of providers) {
     try {
       const result=await transport.request(args);
       if(provider==='solid') logRpcHealth.backup_successes++;
       if(provider==='alchemy') logRpcHealth.alchemy_successes++;
+      if(extraLogTransports.some(entry=>entry.label===provider)) logRpcHealth.slow_successes++;
       logRpcHealth.last_provider=provider;
       return result;
     } catch(error) {
