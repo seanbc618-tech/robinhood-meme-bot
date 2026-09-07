@@ -50,14 +50,21 @@ let solidDisabledUntil=0;
 const ALCHEMY_LOG_CHUNK=10n;
 const ALCHEMY_MAX_FALLBACK_RANGE=900n;
 export const logRpcHealth={public_failures:0,backup_successes:0,alchemy_successes:0,solid_quota_exhausted:0,last_failure:null,last_provider:null};
-function errorText(error) { return String(error?.shortMessage||error?.message||error); }
+function errorText(error) {
+  return [error?.message,error?.shortMessage,error?.details,error?.cause?.message]
+    .filter(Boolean).join(' ') || String(error);
+}
+function safeErrorText(error) {
+  return errorText(error).replace(/https?:\/\/[^\s]+/g,'[RPC URL redacted]')
+    .replace(/(?:ak_|alch_)[a-zA-Z0-9_-]+/g,'[key redacted]').slice(0,180);
+}
 function quotaError(error) { return /402|quota|daily.?response.?quota|too many requests/i.test(errorText(error)); }
 function nextUtcReset() {
   const d=new Date(); d.setUTCHours(24,0,0,0); return d.getTime();
 }
 function noteLogFailure(provider,error,args) {
   const p=args.params?.[0]||{};
-  logRpcHealth.last_failure={provider,method:args.method,from:p.fromBlock,to:p.toBlock,address:p.address,at:Date.now(),code:error.code??error.cause?.code??null,error:errorText(error).slice(0,180)};
+  logRpcHealth.last_failure={provider,method:args.method,from:p.fromBlock,to:p.toBlock,address:p.address,at:Date.now(),code:error.code??error.cause?.code??null,error:safeErrorText(error)};
 }
 async function alchemyLogRequest(args) {
   if(!alchemyLogTransport) throw new Error('ALCHEMY_LOG_UNAVAILABLE');
