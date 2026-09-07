@@ -19,7 +19,7 @@ try {
     const at=line.indexOf('=');
     if(at>0 && !line.startsWith('#')) {
       const key=line.slice(0,at).trim();
-      if(['ROBINHOOD_RPC_URL','ROBINHOOD_TRACE_RPC_URL','ROBINHOOD_WALLET'].includes(key)
+      if(['ROBINHOOD_RPC_URL','ROBINHOOD_LOG_RPC_URL','ROBINHOOD_TRACE_RPC_URL','ROBINHOOD_WALLET'].includes(key)
         && process.env[key]===undefined) process.env[key]=line.slice(at+1).trim();
     }
   }
@@ -37,29 +37,73 @@ export const A = {
 const readTransport = http(
   process.env.ROBINHOOD_RPC_URL || 'https://rpc.mainnet.chain.robinhood.com',
   { retryCount: 0, timeout: 20000, fetchOptions: { headers: { 'User-Agent': 'rh-dog-bot/0.2' } } })({});
-const logTransport=http('https://rpc.mainnet.chain.robinhood.com',{retryCount:0,timeout:4000})({});
+const logTransport=http(process.env.ROBINHOOD_LOG_RPC_URL || 'https://rpc.mainnet.chain.robinhood.com',{
+  retryCount:0,timeout:8000,fetchOptions:{headers:{'User-Agent':'rh-dog-bot/0.2'}}
+})({});
+const alchemyLogTransport=process.env.ROBINHOOD_RPC_URL
+  ?http(process.env.ROBINHOOD_RPC_URL,{retryCount:0,timeout:6000,fetchOptions:{headers:{'User-Agent':'rh-dog-bot/0.2'}}})({})
+  :null;
 const backupLogTransport=process.env.ROBINHOOD_TRACE_RPC_URL
   ?http(process.env.ROBINHOOD_TRACE_RPC_URL,{retryCount:0,timeout:4000})({}):null;
 let backupLogsUntil=0;
-export const logRpcHealth={public_failures:0,backup_successes:0,last_failure:null};
-async function logRequest(args) {
-  const backup=backupLogTransport&&Date.now()<backupLogsUntil;
-  try {
-    const result=await (backup?backupLogTransport:logTransport).request(args);
-    if(backup) logRpcHealth.backup_successes++;
-    return result;
-  } catch(error) {
-    const p=args.params?.[0]||{};
-    logRpcHealth.last_failure={provider:backup?'solid':'public',method:args.method,
-      from:p.fromBlock,to:p.toBlock,address:p.address,at:Date.now(),
-      code:error.code??error.cause?.code??null};
-    if(!backup) logRpcHealth.public_failures++;
-    if(!backupLogTransport||backup) throw error;
-    backupLogsUntil=Date.now()+300000;
-    const result=await backupLogTransport.request(args);
-    logRpcHealth.backup_successes++;
-    return result;
+let solidDisabledUntil=0;
+const ALCHEMY_LOG_CHUNK=10n;
+const ALCHEMY_MAX_FALLBACK_RANGE=900n;
+export const logRpcHealth={public_failures:0,backup_successes:0,alchemy_successes:0,solid_quota_exhausted:0,last_failure:null,last_provider:null};
+function errorText(error) { return String(error?.shortMessage||error?.message||error); }
+function quotaError(error) { return /402|quota|daily.?response.?quota|too many requests/i.test(errorText(error)); }
+function nextUtcReset() {
+  const d=new Date(); d.setUTCHours(24,0,0,0); return d.getTime();
+}
+function noteLogFailure(provider,error,args) {
+  const p=args.params?.[0]||{};
+  logRpcHealth.last_failure={provider,method:args.method,from:p.fromBlock,to:p.toBlock,address:p.address,at:Date.now(),code:error.code??error.cause?.code??null,error:errorText(error).slice(0,180)};
+}
+async function alchemyLogRequest(args) {
+  if(!alchemyLogTransport) throw new Error('ALCHEMY_LOG_UNAVAILABLE');
+  const params=args.params||[];
+  const filter=params[0]||{};
+  if(filter.fromBlock==null||filter.toBlock==null) return alchemyLogTransport.request(args);
+  const from=BigInt(filter.fromBlock),to=BigInt(filter.toBlock);
+  if(to<from) return [];
+  if(to-from+1n>ALCHEMY_MAX_FALLBACK_RANGE) throw new Error('ALCHEMY_LOG_RANGE_TOO_LARGE');
+  const out=[];
+  for(let lo=from;lo<=to;lo+=ALCHEMY_LOG_CHUNK) {
+    const hi=lo+ALCHEMY_LOG_CHUNK-1n<to?lo+ALCHEMY_LOG_CHUNK-1n:to;
+    const chunk={...filter,fromBlock:`0x${lo.toString(16)}`,toBlock:`0x${hi.toString(16)}`};
+    out.push(...await alchemyLogTransport.request({...args,params:[chunk,...params.slice(1)]}));
   }
+  return out;
+}
+async function logRequest(args) {
+  const now=Date.now();
+  const preferSolid=backupLogTransport&&now<backupLogsUntil&&now>=solidDisabledUntil;
+  const providers=[];
+  if(preferSolid) providers.push(['solid',backupLogTransport]);
+  providers.push(['public',logTransport]);
+  if(!preferSolid&&backupLogTransport&&now>=solidDisabledUntil) providers.push(['solid',backupLogTransport]);
+  if(alchemyLogTransport) providers.push(['alchemy',{request:alchemyLogRequest}]);
+  let last;
+  for(const [provider,transport] of providers) {
+    try {
+      const result=await transport.request(args);
+      if(provider==='solid') logRpcHealth.backup_successes++;
+      if(provider==='alchemy') logRpcHealth.alchemy_successes++;
+      logRpcHealth.last_provider=provider;
+      return result;
+    } catch(error) {
+      last=error;noteLogFailure(provider,error,args);
+      if(provider==='public') {
+        logRpcHealth.public_failures++;
+        backupLogsUntil=Date.now()+300000;
+      }
+      if(provider==='solid'&&quotaError(error)) {
+        solidDisabledUntil=nextUtcReset();
+        logRpcHealth.solid_quota_exhausted++;
+      }
+    }
+  }
+  throw last||new Error('RPC_LOG_UNAVAILABLE');
 }
 export const client=createPublicClient({transport:custom({request:args=>
   args.method==='eth_getLogs'?logRequest(args):readTransport.request(args)}, {retryCount:0})});
