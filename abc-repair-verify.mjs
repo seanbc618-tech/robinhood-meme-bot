@@ -7,6 +7,7 @@ import {
   minutesToClose,minuteStart,classifyError,plannedRoundTripFromQuotes,
   collectBuckets,netExitValue,HAIRCUT_BPS,STRATEGY_VERSION,loadBuckets,
   foldStoredEvents,fxContemporaneous,fxForMinute,skipBacklogForLive,saveFxSnap,ensureWatchSlots,logBlocksNeeded,
+  HISTORICAL_FX_STALE_SEC,
   watchSlotDecision,WATCH_MAX_MS,WATCH_POST_MATURITY_MS,rpcRetry,RPC_CALL_TIMEOUT_MS,
 } from './abc-collect.mjs';
 import {
@@ -30,6 +31,8 @@ function tmp(){return mkdtempSync(join(tmpdir(),'abc-repair-'));}
     assert('USDG selects its own valid observation',fxForMinute(store,1200,'0x123').rates?.observed_at===1260);
     saveFxSnap(store,rates(1320,900,900));
     assert('stale source remains rejected',fxForMinute(store,1320,zeroAddress).reason==='SOURCE_LAST_UPDATED_LAG');
+    saveFxSnap(store,rates(1380,1240,1240));
+    assert('historical FX accepts bounded 140s source lag',HISTORICAL_FX_STALE_SEC===180&&fxForMinute(store,1320,zeroAddress).ok);
     const now=1700000000000;
     const ins=store.db.prepare(`INSERT INTO pools(token,pool_id,quote,first_seen_block,first_seen_ts,last_cursor_block,quote_status,registered_ts) VALUES(?,?,?,?,?,?,?,?)`);
     ins.run('old','0x',zeroAddress,1,1,1,'ok',now/1000-25*3600);
@@ -44,6 +47,37 @@ function tmp(){return mkdtempSync(join(tmpdir(),'abc-repair-'));}
     const reopened=openAbc(dir);
     assert('FX evidence survives restart',fxForMinute(reopened,1200,zeroAddress).ok);
     reopened.close();
+  } finally {rmSync(dir,{recursive:true,force:true});}
+}
+
+{
+  const dir=tmp();
+  try {
+    const store=openAbc(dir);
+    const token='0x00000000000000000000000000000000000000ad';
+    const t0=minuteStart(1_700_000_000);
+    const missing=t0+120;
+    store.db.prepare(`INSERT INTO pools(token,pool_id,quote,first_seen_block,first_seen_ts,last_cursor_block,last_event_block,last_complete_minute,quote_status,decimals,quote_decimals)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(token,'0xpool',zeroAddress,1,t0,10,10,missing,'ok',18,18);
+    const pool={token,id:'0xpool',quote:zeroAddress,quoteDecimals:18,decimals:18,key:{currency0:token,currency1:zeroAddress},curve:zeroAddress};
+    store.db.prepare(`INSERT INTO buckets
+      (token,minute,open_usd,high_usd,low_usd,close_usd,volume_usd,buy_usd,sell_usd,net_inflow_usd,buy_recipients,
+       buy_recipient_count,swap_count,no_trade,executable,from_block,to_block,collected_at,source_block,close_sqrt,invalid,fx_note,usd_usable,miss_reason)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      token,t0+60,1,1,1,1,0,0,0,0,'{}',0,0,1,0,null,null,Date.now(),1,String(2n**96n),0,'seed',1,null);
+    store.db.prepare('INSERT INTO minute_status(token,minute,reason,at) VALUES(?,?,?,?)').run(token,missing,'SOURCE_LAST_UPDATED_LAG',Date.now());
+    const end=missing+60;
+    saveFxSnap(store,{observed_at:end,prices:{ethereum:{usd:2000,last_updated_at:end-140},tether:{usd:1,last_updated_at:end-140},'global-dollar':{usd:1,last_updated_at:end-140}}});
+    const rates={observed_at:end+120,prices:{ethereum:{usd:2000,last_updated_at:end+120},tether:{usd:1,last_updated_at:end+120},'global-dollar':{usd:1,last_updated_at:end+120}}};
+    await foldStoredEvents(store,store.db.prepare('SELECT * FROM pools WHERE token=?').get(token),pool,{number:20n,timestamp:BigInt(end+120)},rates,{
+      infra:new Set(),
+      blockTs:async()=>end+120,
+    });
+    const bar=store.db.prepare('SELECT usd_usable,fx_note FROM buckets WHERE token=? AND minute=?').get(token,missing);
+    const status=store.db.prepare('SELECT 1 FROM minute_status WHERE token=? AND minute=?').get(token,missing);
+    const row=store.db.prepare('SELECT last_complete_minute FROM pools WHERE token=?').get(token);
+    assert('late FX retry backfills a previously rejected minute',bar?.usd_usable===1&&/late_fx_retry/.test(bar.fx_note||'')&&!status&&row.last_complete_minute===missing,{bar,status,row});
+    store.close();
   } finally {rmSync(dir,{recursive:true,force:true});}
 }
 

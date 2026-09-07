@@ -8,11 +8,16 @@ import {
 } from './chain.mjs';
 
 export const STRATEGY_VERSION='abc-phase1-v7';
-export const CODE_VERSION='abc-phase1-v7';
+export const CODE_VERSION='abc-phase1-v8';
 export const STALE_SEC=120;
+// Historical minute folding may receive a source timestamp a little after the
+// live freshness boundary.  Keep this separate from STALE_SEC: live quotes,
+// entries, and exits must remain strictly 120 seconds fresh.
+export const HISTORICAL_FX_STALE_SEC=180;
+export const LATE_FX_RETRY_MINUTES=6*60;
 export const CYCLE_TARGET_MS=60000;
 export const ANALYZE_LIMIT=1;
-export const LIVE_WATCH_N=2;
+export const LIVE_WATCH_N=4;
 export const WATCH_TTL_MS=24*3600*1000;
 export const WATCH_POST_MATURITY_MS=2*3600*1000;
 export const WATCH_MAX_MS=36*3600*1000;
@@ -273,18 +278,19 @@ export function saveFxSnap(store,rates) {
 export function fxForMinute(store,minute,quote) {
   const end=Number(minute)+60;
   const eth=quote==null||quote===zeroAddress||String(quote).toLowerCase()===zeroAddress;
+  const limit=HISTORICAL_FX_STALE_SEC;
   // Preserve legacy evidence; choose independently for each quote asset.
   const candidates=store.db.prepare(`SELECT * FROM fx_observations WHERE minute=?
     UNION ALL SELECT * FROM fx_snap WHERE minute=? ORDER BY observed_at DESC`).all(minute,minute);
-  const snap=candidates.find(s=>Math.abs(Number(s.observed_at)-end)<=STALE_SEC
+  const snap=candidates.find(s=>Math.abs(Number(s.observed_at)-end)<=limit
     && (eth?s.eth_last_updated:s.usdg_last_updated)!=null
-    && Math.abs(Number(eth?s.eth_last_updated:s.usdg_last_updated)-end)<=STALE_SEC
+    && Math.abs(Number(eth?s.eth_last_updated:s.usdg_last_updated)-end)<=limit
     && (eth?s.eth_usd:s.usdg_usd)>0)||candidates[0];
   if(!snap) return {ok:false,reason:'NO_FX_SNAP'};
-  if(Math.abs(Number(snap.observed_at)-end)>STALE_SEC) return {ok:false,reason:'OBSERVED_AT_LAG'};
+  if(Math.abs(Number(snap.observed_at)-end)>limit) return {ok:false,reason:'OBSERVED_AT_LAG'};
   const lu=eth?snap.eth_last_updated:snap.usdg_last_updated;
   const px=eth?snap.eth_usd:snap.usdg_usd;
-  if(lu==null||Math.abs(Number(lu)-end)>STALE_SEC) return {ok:false,reason:'SOURCE_LAST_UPDATED_LAG'};
+  if(lu==null||Math.abs(Number(lu)-end)>limit) return {ok:false,reason:'SOURCE_LAST_UPDATED_LAG'};
   if(!(px>0)) return {ok:false,reason:'NO_FX_SNAP'};
   const rates={observed_at:snap.observed_at,prices:{
     ethereum:{usd:snap.eth_usd,last_updated_at:snap.eth_last_updated},
@@ -705,30 +711,57 @@ export async function foldStoredEvents(store,row,pool,block,rates,io={}) {
   try {coveredTs=await tsOf(row.last_event_block);}
   catch(error) {throw new Error('SOURCE_UNAVAILABLE coverage_boundary');}
   const closable=minutesToClose(row.last_complete_minute,firstWatch,coveredTs);
-  if(!closable.length) return {minutes:store.db.prepare('SELECT count(*) c FROM buckets WHERE token=? AND IFNULL(invalid,0)=0').get(token).c,closed:[]};
+  const lastFull=minuteStart(Number(coveredTs))-60;
+  const retrySince=lastFull-LATE_FX_RETRY_MINUTES*60+60;
+  const retryRows=store.db.prepare(`SELECT s.minute FROM minute_status s
+    LEFT JOIN buckets b ON b.token=s.token AND b.minute=s.minute
+    WHERE s.token=? AND s.minute>=? AND s.minute<=?
+      AND s.reason IN ('SOURCE_LAST_UPDATED_LAG','OBSERVED_AT_LAG')
+      AND (b.minute IS NULL OR (IFNULL(b.invalid,0)=0 AND IFNULL(b.usd_usable,0)=0))
+    ORDER BY s.minute`).all(token,retrySince,lastFull);
+  const lateRetrySet=new Set(retryRows.map(r=>Number(r.minute)));
+  const workMinutes=[...new Set([...closable,...lateRetrySet])].sort((a,b)=>a-b);
+  if(!workMinutes.length) return {minutes:store.db.prepare('SELECT count(*) c FROM buckets WHERE token=? AND IFNULL(invalid,0)=0').get(token).c,closed:[]};
   const infra=io.infra||await infraSet(pool.curve||row.curve,block.number);
   let lastPrice=null,lastSqrt=null;
   const prev=store.db.prepare('SELECT close_usd,close_sqrt FROM buckets WHERE token=? AND close_usd IS NOT NULL AND IFNULL(invalid,0)=0 AND IFNULL(usd_usable,0)=1 ORDER BY minute DESC LIMIT 1').get(token);
   if(prev) {lastPrice=prev.close_usd;lastSqrt=prev.close_sqrt;}
-  const insert=store.db.prepare(`INSERT OR IGNORE INTO buckets
+  const insert=store.db.prepare(`INSERT INTO buckets
     (token,minute,open_usd,high_usd,low_usd,close_usd,volume_usd,buy_usd,sell_usd,net_inflow_usd,buy_recipients,
      buy_recipient_count,swap_count,no_trade,executable,from_block,to_block,collected_at,source_block,close_sqrt,invalid,fx_note,usd_usable,miss_reason)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(token,minute) DO UPDATE SET
+      open_usd=excluded.open_usd,high_usd=excluded.high_usd,low_usd=excluded.low_usd,close_usd=excluded.close_usd,
+      volume_usd=excluded.volume_usd,buy_usd=excluded.buy_usd,sell_usd=excluded.sell_usd,net_inflow_usd=excluded.net_inflow_usd,
+      buy_recipients=excluded.buy_recipients,buy_recipient_count=excluded.buy_recipient_count,swap_count=excluded.swap_count,
+      no_trade=excluded.no_trade,executable=excluded.executable,from_block=excluded.from_block,to_block=excluded.to_block,
+      collected_at=excluded.collected_at,source_block=excluded.source_block,close_sqrt=excluded.close_sqrt,
+      invalid=excluded.invalid,fx_note=excluded.fx_note,usd_usable=excluded.usd_usable,miss_reason=excluded.miss_reason`);
   const noteStatus=store.db.prepare('INSERT OR REPLACE INTO minute_status(token,minute,reason,at) VALUES(?,?,?,?)');
+  const clearStatus=store.db.prepare('DELETE FROM minute_status WHERE token=? AND minute=?');
   const collectedAt=Date.now();
   const closed=[];
   store.db.exec('BEGIN');
   try {
-    for(const minute of closable) {
+    for(const minute of workMinutes) {
+      const lateRetry=lateRetrySet.has(minute);
+      // A late retry can be older than the current cursor.  Re-seed the
+      // no-trade carry-forward from the last valid bucket strictly before it;
+      // never use a future bucket as a historical price.
+      if(lateRetry) {
+        const prior=store.db.prepare('SELECT close_usd,close_sqrt FROM buckets WHERE token=? AND minute<? AND close_usd IS NOT NULL AND IFNULL(invalid,0)=0 AND IFNULL(usd_usable,0)=1 ORDER BY minute DESC LIMIT 1').get(token,minute);
+        lastPrice=prior?.close_usd??null;
+        lastSqrt=prior?.close_sqrt??null;
+      }
       const fx=fxForMinute(store,minute,pool.quote);
       const usable=fx.ok;
       const pxUse=usable?fx.px:quoteUsd(pool,rates);
       const ratesUse=usable?fx.rates:rates;
       const fxNote=usable
-        ? `fx_snap observed_at=${fx.rates.observed_at} last_updated=${ethUpdated(fx.rates,pool.quote)} CONTEMPORANEOUS`
+        ? `fx_snap observed_at=${fx.rates.observed_at} last_updated=${ethUpdated(fx.rates,pool.quote)} CONTEMPORANEOUS${lateRetry?';late_fx_retry':''}`
         : `fx_snap reason=${fx.reason}`;
       const existing=store.db.prepare('SELECT minute,close_usd,close_sqrt,invalid,usd_usable FROM buckets WHERE token=? AND minute=?').get(token,minute);
-      if(existing) {
+      if(existing&&(!lateRetry||existing.invalid||existing.usd_usable)) {
         if(!existing.invalid&&existing.usd_usable&&existing.close_usd>0) {lastPrice=existing.close_usd;lastSqrt=existing.close_sqrt;}
         continue;
       }
@@ -742,6 +775,7 @@ export async function foldStoredEvents(store,row,pool,block,rates,io={}) {
         if(!(lastPrice>0)||!usable) {noteStatus.run(token,minute,usable?'NOT_COLLECTED':(fx.reason||'NO_FX_SNAP'),collectedAt);continue;}
         insert.run(token,minute,lastPrice,lastPrice,lastPrice,lastPrice,0,0,0,0,'{}',0,0,1,0,
           null,null,collectedAt,Number(block.number),lastSqrt,0,fxNote,1,null);
+        if(lateRetry) clearStatus.run(token,minute);
         closed.push(minute);continue;
       }
       const prices=swaps.map(e=>sqrtPriceToUsd(pool,BigInt(e.sqrt),ratesUse)).filter(v=>v>0);
@@ -772,10 +806,12 @@ export async function foldStoredEvents(store,row,pool,block,rates,io={}) {
       insert.run(token,minute,open,high,low,close,volume,buy,sell,net,JSON.stringify(recipients),
         Object.keys(recipients).length,swaps.length,0,1,swaps[0].block,swaps[swaps.length-1].block,
         collectedAt,Number(block.number),swaps[swaps.length-1].sqrt,0,fxNote,usable?1:0,usable?null:fx.reason);
+      if(usable&&lateRetry) clearStatus.run(token,minute);
       closed.push(minute);
     }
     if(closed.length) {
-      const last=closed[closed.length-1];
+      const priorLast=row.last_complete_minute==null?null:Number(row.last_complete_minute);
+      const last=Math.max(priorLast??-1,closed[closed.length-1]);
       store.db.prepare('UPDATE pools SET last_complete_minute=? WHERE token=?').run(last,token);
       row.last_complete_minute=last;
     }
