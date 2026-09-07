@@ -7,8 +7,8 @@ import {
   poolFor,quoteExact,quoteUsd,usdRates,blockContext,holderData,roundTrip,stringify,
 } from './chain.mjs';
 
-export const STRATEGY_VERSION='abc-phase1-v7';
-export const CODE_VERSION='abc-phase1-v8';
+export const STRATEGY_VERSION='abc-phase1-v9';
+export const CODE_VERSION='abc-phase1-v9';
 export const STALE_SEC=120;
 // Historical minute folding may receive a source timestamp a little after the
 // live freshness boundary.  Keep this separate from STALE_SEC: live quotes,
@@ -208,7 +208,7 @@ export function openAbc(home) {
 
 export function initAccounts(store) {
   const now=Date.now();
-  for(const [strategy,principal,spend] of [['A',30,35],['B',30,35],['C',15,20]]) {
+  for(const [strategy,principal,spend] of [['A',30,35],['B',30,35],['C',30,35]]) {
     const exists=store.db.prepare('SELECT strategy FROM accounts WHERE strategy=?').get(strategy);
     if(exists) continue;
     const payload={
@@ -223,6 +223,14 @@ export function initAccounts(store) {
     };
     store.db.prepare('INSERT INTO accounts VALUES(?,?)').run(strategy,JSON.stringify(payload));
   }
+}
+
+export function migrateCSize(store) {
+  const account=readAccount(store,'C');
+  if(account.principal_limit!==15||account.spend_limit!==20) return;
+  account.principal_limit=30;account.spend_limit=35;
+  account.size_migration={version:CODE_VERSION,at:Date.now(),previous_principal:15,previous_spend:20};
+  writeAccount(store,account);
 }
 
 export function readAccount(store,strategy) {

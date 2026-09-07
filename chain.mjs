@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import {enabled,broadcast,marketMessage} from './telegram.mjs';
+import {transferHistory} from './holder-history.mjs';
 
 export const ROOT = dirname(fileURLToPath(import.meta.url));
 // Local secrets are ignored by git. Explicit environment variables take precedence.
@@ -244,9 +245,16 @@ export async function blockAtTime(timestamp, head) {
   }
   return low;
 }
+export async function warmHolderHistory(token,blockNumber,options={}) {
+  return transferHistory(client,erc20.find(a=>a.name==='Transfer'),token,blockNumber,{
+    path:resolve(ROOT,'data/holder-history.sqlite'),...options,
+  });
+}
 export async function holderData(pool, blockNumber) {
-  const logs=await client.getLogs({address:pool.token,event:erc20.find(a=>a.name==='Transfer'),fromBlock:0n,toBlock:blockNumber,strict:true});
-  requireValue(logs.length>0 && logs.length<20000,'TRANSFER_HISTORY_EMPTY_OR_TOO_LARGE');
+  const history=await warmHolderHistory(pool.token,blockNumber);
+  requireValue(history.complete,'HOLDER_HISTORY_WARMUP');
+  const logs=history.logs;
+  requireValue(logs.length>0,'TRANSFER_HISTORY_EMPTY');
   const balances=new Map(); let minted=false;
   for (const log of logs) {
     requireValue(!log.removed,'REMOVED_TRANSFER');

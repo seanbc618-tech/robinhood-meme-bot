@@ -1,6 +1,6 @@
 import {existsSync,readFileSync,unlinkSync,writeSync,openSync,closeSync,mkdirSync} from 'node:fs';
 import {resolve} from 'node:path';
-import {ROOT,client,save,failure,logRpcHealth} from './chain.mjs';
+import {ROOT,client,save,failure,logRpcHealth,warmHolderHistory} from './chain.mjs';
 import {broadcast,enabled} from './telegram.mjs';
 import {
   abcDir,openAbc,initAccounts,readAccount,writeAccount,readRun,writeRun,
@@ -11,7 +11,7 @@ import {
   markV1BucketsInvalid,CODE_VERSION,COLLECT_BUDGET_MS,
   slimSignalResult,poolFromRow,isolateNonContemporaneousFx,
   pickLiveWatch,skipBacklogForLive,LIVE_WATCH_N,saveFxSnap,logBlocksNeeded,
-  extendActiveWatchBounds,
+  extendActiveWatchBounds,migrateCSize,
 } from './abc-collect.mjs';
 import {
   recordEvalFromCycle,ensureScreeningSchema,
@@ -188,9 +188,22 @@ export async function cycle(store,now=Date.now(),io={}) {
     try {catalog=await (io.syncCatalog||syncCatalog)(store,block,rpcIo);}
     catch(error) {run.last_pool_error={token:null,error:failure(error),kind:classifyError(error)};}
   }
+  // Warm one watch's full holder history after price collection and catalog.
+  // Injected offline collectors never make this extra network request.
+  if(!io.collectBuckets&&watch.live.length&&Date.now()+5000<collectDeadline) {
+    const row=watch.live[(run.rounds||0)%watch.live.length];
+    try {
+      const h=await warmHolderHistory(row.token,block.number,{
+        birthUpper:row.registered_block??row.first_seen_block,
+        deadline:Math.min(collectDeadline-4000,Date.now()+12000),maxChunks:8,
+      });
+      run.holder_history={token:row.token,complete:h.complete,stage:h.stage,cursor:h.cursor,at:Date.now()};
+    } catch(e) {run.holder_history={token:row.token,error:failure(e),at:Date.now()};}
+  }
   Object.assign(run,readRun(store),{
     status:run.status,last_started_at:run.last_started_at,code_version:CODE_VERSION,exits_ms:run.exits_ms,
     live_watch:run.live_watch,last_pool_error:run.last_pool_error,
+    holder_history:run.holder_history,
   });
   // Apply this cycle's FX diagnostics after merging persisted collector state.
   run.usd_source_age_sec=usdSourceAge(rates,now/1000);
@@ -242,6 +255,7 @@ export async function worker(hours,foreground=false) {
   process.on('SIGTERM',onStop);process.on('SIGINT',onStop);
   try {
     initAccounts(store);
+    migrateCSize(store);
     let run=readRun(store);
     if(run&&run.code_version!==CODE_VERSION) {
       if(!run.code_version||run.code_version==='abc-phase1-v1') {

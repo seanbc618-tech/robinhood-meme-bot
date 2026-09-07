@@ -2,12 +2,14 @@ import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {zeroAddress} from 'viem';
+import {transferHistory} from './holder-history.mjs';
 import {
   openAbc,initAccounts,readAccount,writeAccount,writeRun,readRun,
   minutesToClose,minuteStart,classifyError,plannedRoundTripFromQuotes,
   collectBuckets,netExitValue,HAIRCUT_BPS,STRATEGY_VERSION,loadBuckets,
   foldStoredEvents,fxContemporaneous,fxForMinute,skipBacklogForLive,saveFxSnap,ensureWatchSlots,logBlocksNeeded,
   HISTORICAL_FX_STALE_SEC,
+  migrateCSize,
   watchSlotDecision,WATCH_MAX_MS,WATCH_POST_MATURITY_MS,rpcRetry,RPC_CALL_TIMEOUT_MS,
 } from './abc-collect.mjs';
 import {
@@ -18,6 +20,41 @@ import {
 const fails=[];
 function assert(name,ok,detail){if(ok) console.log('PASS',name); else {console.log('FAIL',name,detail||'');fails.push(name);}}
 function tmp(){return mkdtempSync(join(tmpdir(),'abc-repair-'));}
+
+{
+  const dir=tmp();
+  try {
+    let fail=false;
+    const ranges=[];
+    const rpc={
+      getCode:async({blockNumber})=>blockNumber>=100n?'0x1234':'0x',
+      getBlock:async({blockNumber})=>({hash:'hash'+blockNumber}),
+      getLogs:async({fromBlock,toBlock})=>{
+        ranges.push([fromBlock,toBlock]);
+        if(fail) throw new Error('source unavailable');
+        return [100n,5200n,10200n].filter(b=>b>=fromBlock&&b<=toBlock).map(b=>({blockNumber:b,logIndex:0,removed:false,args:{from:zeroAddress,to:'alice',value:1n}}));
+      },
+    };
+    const opt={path:join(dir,'holders.sqlite'),maxChunks:1,birthUpper:6000n};
+    const first=await transferHistory(rpc,{},'token',11000n,opt);
+    assert('holder history begins at deployment before registration and is incomplete after one page',!first.complete&&first.cursor===5099&&ranges[0][0]===100n);
+    fail=true;
+    try {await transferHistory(rpc,{},'token',11000n,opt);} catch {}
+    fail=false;
+    const done=await transferHistory(rpc,{},'token',11000n,{...opt,maxChunks:3});
+    assert('holder history resumes failed page and conserves every event',done.complete&&done.logs.length===3&&done.logs[0].args.value===1n&&ranges[1][0]===ranges[2][0]);
+    const past=await transferHistory(rpc,{},'token',6000n,opt);
+    assert('holder historical read excludes later events',past.complete&&past.logs.length===2&&past.logs.every(l=>l.blockNumber<=6000n));
+    rpc.getBlock=async()=>({hash:'changed'});
+    let reorg=false;try {await transferHistory(rpc,{},'token',11000n,opt);}catch(e){reorg=e.message==='HOLDER_HISTORY_REORG';}
+    assert('holder cache refuses changed canonical anchor',reorg);
+    const store=openAbc(dir);initAccounts(store);
+    const a=readAccount(store,'C');a.principal_limit=15;a.spend_limit=20;a.cash=912;a.trades=[{id:'preserved'}];writeAccount(store,a);
+    migrateCSize(store);const migrated=readAccount(store,'C');migrateCSize(store);
+    assert('C size migration changes limits only and is idempotent',migrated.cash===912&&migrated.trades[0].id==='preserved'&&migrated.principal_limit===30&&migrated.spend_limit===35&&JSON.stringify(readAccount(store,'C'))===JSON.stringify(migrated));
+    store.close();
+  } finally {rmSync(dir,{recursive:true,force:true});}
+}
 
 {
   const dir=tmp();
@@ -353,7 +390,7 @@ function tmp(){return mkdtempSync(join(tmpdir(),'abc-repair-'));}
   } finally {rmSync(dir,{recursive:true,force:true});}
 }
 
-assert('strategy version is v7',STRATEGY_VERSION==='abc-phase1-v7');
+assert('strategy version is v9',STRATEGY_VERSION==='abc-phase1-v9');
 {
   const dir=tmp();
   try {
