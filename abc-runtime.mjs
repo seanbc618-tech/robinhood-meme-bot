@@ -190,7 +190,7 @@ export async function cycle(store,now=Date.now(),io={}) {
   }
   // Warm one watch's full holder history after price collection and catalog.
   // Injected offline collectors never make this extra network request.
-  if(!io.collectBuckets&&watch.live.length&&Date.now()+5000<collectDeadline) {
+  if(!io.collectBuckets&&!io.blockContext&&watch.live.length&&Date.now()+5000<collectDeadline) {
     const row=watch.live[(run.rounds||0)%watch.live.length];
     try {
       const h=await warmHolderHistory(row.token,block.number,{
