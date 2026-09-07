@@ -55,11 +55,14 @@ let publicNextAt=0;
 function extraLogConfig() {
   return String(process.env.ROBINHOOD_LOG_RPC_URLS||'').split(',').map((item,index)=>{
     const at=item.indexOf('|');
-    const label=(at>0?item.slice(0,at):`extra${index+1}`).trim();
+    const rawLabel=(at>0?item.slice(0,at):`extra${index+1}`).trim();
     const url=(at>0?item.slice(at+1):item).trim();
     if(!/^https?:\/\//i.test(url)) return null;
+    const rangeMatch=rawLabel.match(/^(.*):(\d+)$/);
+    const label=(rangeMatch?rangeMatch[1]:rawLabel).trim();
+    const maxRange=rangeMatch?Number(rangeMatch[2]):null;
     const lower=label.toLowerCase();
-    return {label,url,intervalMs:lower.includes('quick')?1200:1000};
+    return {label,url,maxRange,intervalMs:lower.includes('quick')?1200:1000};
   }).filter(Boolean);
 }
 const extraLogTransports=extraLogConfig().map(entry=>({...entry,
@@ -125,14 +128,17 @@ async function extraLogRequest(entry,args) {
 }
 async function logRequest(args) {
   const now=Date.now();
+  const p=args.params?.[0]||{};
+  const range=p.fromBlock!=null&&p.toBlock!=null?BigInt(p.toBlock)-BigInt(p.fromBlock)+1n:null;
   const preferSolid=backupLogTransport&&now<backupLogsUntil&&now>=solidDisabledUntil;
   const providers=[];
   if(preferSolid) providers.push(['solid',backupLogTransport]);
   providers.push(['public',{request:publicLogRequest}]);
   if(!preferSolid&&backupLogTransport&&now>=solidDisabledUntil) providers.push(['solid',backupLogTransport]);
-  for(const entry of extraLogTransports) providers.push([entry.label,{request:args=>extraLogRequest(entry,args)}]);
-  const p=args.params?.[0]||{};
-  const range=p.fromBlock!=null&&p.toBlock!=null?BigInt(p.toBlock)-BigInt(p.fromBlock)+1n:null;
+  for(const entry of extraLogTransports) {
+    if(entry.maxRange!=null&&range!=null&&range>BigInt(entry.maxRange)) continue;
+    providers.push([entry.label,{request:args=>extraLogRequest(entry,args)}]);
+  }
   if(alchemyLogTransport&&(range==null||range<=ALCHEMY_MAX_FALLBACK_RANGE)) providers.push(['alchemy',{request:alchemyLogRequest}]);
   let last;
   for(const [provider,transport] of providers) {
