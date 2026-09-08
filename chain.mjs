@@ -88,6 +88,9 @@ const ALCHEMY_LOG_CHUNK=10n;
 const ALCHEMY_MAX_FALLBACK_RANGE=900n;
 const PUBLIC_LOG_MIN_INTERVAL_MS=150;
 const ALCHEMY_LOG_RETRIES=2;
+// A public 429 or timeout is transient; the old five-minute blackout forced whole
+// cycles onto the 10-block Alchemy path, which cannot keep up with the chain.
+const PUBLIC_LOG_PAUSE_MS=30000;
 let publicNextAt=0;
 let publicDisabledUntil=0;
 function extraLogConfig() {
@@ -200,7 +203,7 @@ async function logRequest(args) {
       if(extra) extra.disabledUntil=logProviderPauseUntil(error);
       if(provider==='public') {
         logRpcHealth.public_failures++;
-        backupLogsUntil=Date.now()+300000;
+        backupLogsUntil=Date.now()+PUBLIC_LOG_PAUSE_MS;
         publicDisabledUntil=backupLogsUntil;
       }
       if(provider==='solid'&&quotaError(error)) {
