@@ -372,10 +372,11 @@ export function ensureRoleWatchSlots(store,now=Date.now(),n=LIVE_WATCH_N) {
   for(const slot of store.db.prepare("SELECT * FROM watch_slots WHERE COALESCE(status,'ACTIVE')='ACTIVE'").all()) {
     const p=byToken.get(slot.token),grad=p&&graduationTs(p),role=watchRole(slot.slot);
     const age=grad==null?null:now/1000-grad;
+    const mismatch=age==null||age<0||(role==='B'&&age<22*3600)||(role==='A'&&age<2*3600);
     const expired=role==='C'?(age==null||age>=6*3600):now>=slot.seated_at+WATCH_MAX_MS;
     const idle=now-slot.seated_at>=(role==='C'?30:120)*60000&&activityIdle(store,slot.token,now);
-    if(expired||idle) {
-      const reason=expired?'WATCH_ROLE_EXPIRED':'WATCH_OBSERVED_INACTIVE_30M';
+    if(mismatch||expired||idle) {
+      const reason=mismatch?'WATCH_ROLE_MISMATCH':expired?'WATCH_ROLE_EXPIRED':'WATCH_OBSERVED_INACTIVE_30M';
       store.db.exec('BEGIN');
       try {archiveSlot(store,slot,now,reason);store.db.prepare('UPDATE watch_slots SET status=? WHERE slot=?').run(reason,slot.slot);store.db.exec('COMMIT');}
       catch(e){store.db.exec('ROLLBACK');throw e;}

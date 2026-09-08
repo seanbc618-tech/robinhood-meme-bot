@@ -819,5 +819,29 @@ assert('strategy version is v10',STRATEGY_VERSION==='abc-phase1-v10');
   } finally {catalogClient.getLogs=getLogs;rmSync(dir,{recursive:true,force:true});}
 }
 
+{
+  const dir=tmp();
+  try {
+    const st=openAbc(dir);initAccounts(st);const now=Date.now(),ts=Math.floor(now/1000);
+    const accountsBefore=st.db.prepare('SELECT * FROM accounts ORDER BY strategy').all();
+    writeRun(st,{started_at:123,ends_at:456});
+    for(const [token,hours] of [['youngB',4],['youngA',1],['matureB',25],['matureA',8],['retainedC',5.75]])
+      st.db.prepare("INSERT INTO pools(token,registered_ts,quote_status) VALUES(?,?,'ok')").run(token,ts-hours*3600);
+    for(const [slot,token] of [[1,'youngB'],[2,'retainedC'],[3,'youngA']])
+      st.db.prepare("INSERT INTO watch_slots VALUES(?,?,?,?,'ACTIVE')").run(slot,token,now-600000,now+3600000);
+    const runBefore=readRun(st);const watch=ensureRoleWatchSlots(st,now);
+    const slots=Object.fromEntries(watch.live.map(r=>[r._slot,r.token]));
+    assert('existing wrong-role B and A slots migrate to eligible pools',slots[1]==='matureB'&&['youngB','matureA'].includes(slots[3]),slots);
+    const history=st.db.prepare('SELECT * FROM watch_slot_history ORDER BY slot').all();
+    assert('migration archives original seats and preserves valid late C seat',history.length===2&&history.every(r=>r.end_reason==='WATCH_ROLE_MISMATCH'&&r.seated_at===now-600000)&&slots[2]==='retainedC');
+    ensureRoleWatchSlots(st,now);
+    assert('role migration is idempotent and preserves accounts and experiment dates',st.db.prepare('SELECT count(*) n FROM watch_slot_history').get().n===2&&JSON.stringify(accountsBefore)===JSON.stringify(st.db.prepare('SELECT * FROM accounts ORDER BY strategy').all())&&JSON.stringify(readRun(st))===JSON.stringify(runBefore));
+    st.db.prepare("DELETE FROM pools WHERE token='matureB'").run();
+    const empty=ensureRoleWatchSlots(st,now);
+    assert('B remains empty when no eligible replacement exists',!empty.live.some(r=>r._slot===1));
+    st.close();
+  } finally {rmSync(dir,{recursive:true,force:true});}
+}
+
 if(fails.length){console.error('FAILED',fails.length,fails.join(','));process.exitCode=1;}
 else console.log('ALL_REPAIR_CHECKS_PASSED',fails.length);
