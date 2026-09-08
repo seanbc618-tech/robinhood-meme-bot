@@ -3,13 +3,13 @@ import {mkdirSync} from 'node:fs';
 import {dirname} from 'node:path';
 
 // Separate, disposable source cache. Never shares the paper account tables.
-export async function transferHistory(rpc,event,token,target,{path,deadline=Date.now()+15000,maxChunks=8,birthUpper}={}) {
+export async function transferHistory(rpc,event,token,target,{path,deadline=Date.now()+15000,maxChunks=8,birthUpper,request=(fn)=>fn()}={}) {
   target=BigInt(target);token=token.toLowerCase();
   const call=async(method,args)=>{
     const ms=Math.min(12000,deadline-Date.now());
     if(ms<=0) throw new Error('HOLDER_HISTORY_DEADLINE');
     let timer;
-    try {return await Promise.race([rpc[method](args),new Promise((_,reject)=>{
+    try {return await Promise.race([request(()=>rpc[method](args),ms,'holder '+method),new Promise((_,reject)=>{
       timer=setTimeout(()=>reject(new Error('HOLDER_HISTORY_DEADLINE')),ms);
     })]);} finally {clearTimeout(timer);}
   };

@@ -1,3 +1,4 @@
+import {createServer} from 'node:http';
 import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -17,6 +18,8 @@ import {
   evaluateA,exitDecision,pnlMultiple,nextTickDeadline,sleepUntil,
 } from './abc.mjs';
 
+import {ensureRoleWatchSlots} from './abc-collect.mjs';
+import {evaluators} from './abc-strategy.mjs';
 const fails=[];
 function assert(name,ok,detail){if(ok) console.log('PASS',name); else {console.log('FAIL',name,detail||'');fails.push(name);}}
 function tmp(){return mkdtempSync(join(tmpdir(),'abc-repair-'));}
@@ -390,7 +393,7 @@ function tmp(){return mkdtempSync(join(tmpdir(),'abc-repair-'));}
   } finally {rmSync(dir,{recursive:true,force:true});}
 }
 
-assert('strategy version is v9',STRATEGY_VERSION==='abc-phase1-v9');
+assert('strategy version is v10',STRATEGY_VERSION==='abc-phase1-v10');
 {
   const dir=tmp();
   try {
@@ -545,7 +548,7 @@ assert('strategy version is v9',STRATEGY_VERSION==='abc-phase1-v9');
       store.db.prepare(`INSERT INTO pools(token,pool_id,quote,first_seen_block,first_seen_ts,last_cursor_block,quote_status,decimals,quote_decimals)
         VALUES(?,?,?,?,?,?,?,?,?)`).run(tok,'0x',zeroAddress,1,1,1,'ok',18,18);
     }
-    store.db.prepare('UPDATE pools SET registered_ts=?').run(Math.floor(Date.now()/1000)-3600);
+    store.db.prepare('UPDATE pools SET registered_ts=?').run(1);
     let collects=0;
     const io={
       skipCatalog:true,skipLiveJump:true,gasPrice:1n,collectBudgetMs:25,liveWatchN:3,
@@ -670,6 +673,7 @@ assert('strategy version is v9',STRATEGY_VERSION==='abc-phase1-v9');
     const token='0x00000000000000000000000000000000000000cc';
     store.db.prepare(`INSERT INTO pools(token,pool_id,quote,first_seen_block,first_seen_ts,last_cursor_block,quote_status,decimals,quote_decimals)
       VALUES(?,?,?,?,?,?,?,?,?)`).run(token,'0xpool',zeroAddress,1,1,1,'ok',18,18);
+    store.db.prepare('UPDATE pools SET registered_ts=1 WHERE token=?').run(token);
     const order=[];
     const io={
       skipLiveJump:true,gasPrice:1n,
@@ -680,7 +684,7 @@ assert('strategy version is v9',STRATEGY_VERSION==='abc-phase1-v9');
       syncCatalog:async()=>{order.push('catalog');return {added:0};},
     };
     await cycle(store,200000,io);
-    assert('watch collect runs before catalog',order[0]==='collect'&&order.includes('catalog'),order);
+    assert('live catalog runs before watch collection',order[0]==='catalog'&&order.includes('collect'),order);
     store.close();
   } finally {rmSync(dir,{recursive:true,force:true});}
 }
@@ -715,6 +719,92 @@ assert('strategy version is v9',STRATEGY_VERSION==='abc-phase1-v9');
     await rpcRetry(async(ms)=>{seen.push(ms);throw new Error('RPC_TIMEOUT');},{deadline,rpcRetries:1,rpcRetryDelayMs:0,rpcTimeoutMs:12000});
   } catch {}
   assert('single rpc timeout capped to remaining budget',seen.length===1&&seen[0]>0&&seen[0]<=80&&seen[0]<=RPC_CALL_TIMEOUT_MS,seen);
+}
+
+{
+  const dir=tmp(), original=evaluators.C;
+  try {
+    const store=openAbc(dir);initAccounts(store);
+    const now=Date.now(), minute=Math.floor(now/60000)*60-60;
+    const token='0x00000000000000000000000000000000000000dd';
+    store.db.prepare(`INSERT INTO pools(token,pool_id,quote,registered_ts,first_seen_ts,last_cursor_block,quote_status,decimals,quote_decimals)
+      VALUES(?,?,?,?,?,?,?,?,?)`).run(token,'0xpool',zeroAddress,minute-3600,minute-3600,1,'ok',18,18);
+    writeRun(store,{started_at:now,ends_at:now+3600000,catalog_cursor:'1'});
+    const seen=[];evaluators.C=(b,p,g,m)=>{seen.push(m);return {persist:{phase:'seek'},signal:null};};
+    let t=minute+60;
+    const io={liveWatchN:1,skipCatalog:true,skipLiveJump:true,skipScreeningRecord:true,gasPrice:1n,
+      blockContext:async()=>({number:1n,timestamp:BigInt(t)}),
+      usdRates:async()=>({observed_at:t,prices:Object.fromEntries(['ethereum','tether','global-dollar'].map(k=>[k,{usd:1,last_updated_at:t}]))}),
+      collectBuckets:async()=>{}};
+    await cycle(store,t*1000,io);await cycle(store,t*1000,io);
+    t+=180;await cycle(store,t*1000,io);
+    assert('minute cursor is idempotent and visits every missing minute',JSON.stringify(seen)===JSON.stringify([minute,minute+60,minute+120,minute+180]),seen);
+    assert('missing minute resets setup without fabricating buckets',readAccount(store,'C').signal_state[token]===null&&store.db.prepare('SELECT count(*) n FROM buckets').get().n===0);
+    store.close();
+  } finally {evaluators.C=original;rmSync(dir,{recursive:true,force:true});}
+}
+{
+  const dir=tmp();
+  try {
+    const store=openAbc(dir),now=Date.now(),ts=Math.floor(now/1000);
+    for(const [token,age] of [['mature',25],['middle',3],['young',1],['young2',2],['idle',26]]) {
+      store.db.prepare("INSERT INTO pools(token,registered_ts,quote_status) VALUES(?,?,'ok')").run(token,ts-age*3600);
+      store.db.prepare('INSERT INTO pool_activity(token,first_probe,last_probe,last_swap,swaps) VALUES(?,?,?,?,?)').run(token,ts-7200,ts,token==='idle'?ts-3600:ts,token==='idle'?0:2);
+    }
+    const watch=ensureRoleWatchSlots(store,now);
+    const slots=Object.fromEntries(watch.live.map(r=>[r._slot,r.token]));
+    assert('roles admit active mature B and separate young C without selecting observed idle pool',slots[1]==='mature'&&['middle','young2'].includes(slots[3])&&[slots[2],slots[4]].includes('young')&&!Object.values(slots).includes('idle'),slots);
+    store.close();
+  } finally {rmSync(dir,{recursive:true,force:true});}
+}
+
+{
+  const dir=tmp(),original=evaluators.C;
+  try {
+    const st=openAbc(dir);initAccounts(st);const now=Date.now(),m=Math.floor(now/60000)*60-60;
+    const token='0x00000000000000000000000000000000000000ee';
+    st.db.prepare("INSERT INTO pools(token,pool_id,quote,registered_ts,last_cursor_block,quote_status,decimals,quote_decimals) VALUES(?,?,?,?,?,'ok',18,18)").run(token,'0xpool',zeroAddress,m-3600,1);
+    st.db.prepare(`INSERT INTO buckets(token,minute,close_usd,usd_usable,invalid,volume_usd,buy_usd,sell_usd,net_inflow_usd,buy_recipients,buy_recipient_count,swap_count,no_trade,executable,collected_at) VALUES(?,?,1,1,0,0,0,0,0,'{}',0,0,1,1,1)`).run(token,m);
+    writeRun(st,{started_at:now,ends_at:now+3600000,catalog_cursor:'1'});
+    evaluators.C=(b,p,g,t)=>({signal:t===m?{strategy:'C',minute:m,block:1}:null,persist:{phase:'fired'}});
+    let t=m+60,attempts=0;
+    const io={liveWatchN:1,skipCatalog:true,skipLiveJump:true,skipScreeningRecord:true,gasPrice:1n,
+      blockContext:async()=>({number:1n,timestamp:BigInt(t)}),
+      usdRates:async()=>({observed_at:t,prices:Object.fromEntries(['ethereum','tether','global-dollar'].map(k=>[k,{usd:1,last_updated_at:t}]))}),
+      collectBuckets:async()=>{},poolFor:async()=>({token,liquidity:1n,sqrtPriceX96:1n}),
+      safetyScreen:async()=>({ok:false,reasons:[++attempts===1?'SOURCE_UNAVAILABLE':'FEWER_THAN_15_HOLDERS']})};
+    await cycle(st,t*1000,io);
+    assert('transient entry retains bounded pending signal',!!readAccount(st,'C').pending_signals[token]);
+    t+=60;await cycle(st,t*1000,io);await cycle(st,t*1000,io);
+    assert('next minute retries once and permanent rejection clears pending without a fill',attempts===2&&!readAccount(st,'C').pending_signals[token]&&readAccount(st,'C').trades.length===0);
+    const a=readAccount(st,'C');a.pending_signals[token]={signal:{strategy:'C',minute:m,block:1},expires_at:t*1000};writeAccount(st,a);
+    await cycle(st,t*1000,io);
+    assert('expired pending does not chase or submit',attempts===2&&!readAccount(st,'C').pending_signals[token]);
+    st.close();
+  } finally {evaluators.C=original;rmSync(dir,{recursive:true,force:true});}
+}
+
+{
+  const keys=['ROBINHOOD_RPC_URL','ROBINHOOD_LOG_RPC_URL','ROBINHOOD_LOG_RPC_URLS','ROBINHOOD_TRACE_RPC_URL'];
+  const before=Object.fromEntries(keys.map(k=>[k,process.env[k]]));
+  const server=createServer();let calls=0,aborted=0;
+  server.on('request',(req,res)=>{
+    calls++;req.resume();const timer=setTimeout(()=>res.end(JSON.stringify({jsonrpc:'2.0',id:1,result:'0x1237'})),500);
+    res.on('close',()=>{if(!res.writableEnded)aborted++;clearTimeout(timer);});
+  });
+  try {
+    await new Promise(r=>server.listen(0,'127.0.0.1',r));
+    const url='http://127.0.0.1:'+server.address().port;
+    Object.assign(process.env,{ROBINHOOD_RPC_URL:url,ROBINHOOD_LOG_RPC_URL:url,ROBINHOOD_LOG_RPC_URLS:'',ROBINHOOD_TRACE_RPC_URL:''});
+    const network=await import('./chain.mjs?abort-verification');
+    let rejected=false;
+    try {await network.withRpcDeadline(()=>network.client.getChainId(),80,'abort integration');} catch {rejected=true;}
+    await new Promise(r=>setTimeout(r,150));
+    assert('deadline aborts real HTTP request without launching fallback',rejected&&calls===1&&aborted===1,{rejected,calls,aborted});
+  } finally {
+    server.closeAllConnections();await new Promise(r=>server.close(r));
+    for(const k of keys) {if(before[k]===undefined)delete process.env[k];else process.env[k]=before[k];}
+  }
 }
 
 if(fails.length){console.error('FAILED',fails.length,fails.join(','));process.exitCode=1;}

@@ -4,11 +4,11 @@ import {resolve} from 'node:path';
 import {formatUnits,parseUnits,getAddress,zeroAddress} from 'viem';
 import {
   ROOT,A,client,erc20,factoryAbi,hookAbi,swapEvent,failure,requireValue,same,save,
-  poolFor,quoteExact,quoteUsd,usdRates,blockContext,holderData,roundTrip,stringify,
+  poolFor,quoteExact,quoteUsd,usdRates,blockContext,holderData,roundTrip,stringify,withRpcDeadline,
 } from './chain.mjs';
 
-export const STRATEGY_VERSION='abc-phase1-v9';
-export const CODE_VERSION='abc-phase1-v9';
+export const STRATEGY_VERSION='abc-phase1-v10';
+export const CODE_VERSION='abc-phase1-v10';
 export const STALE_SEC=120;
 // Historical minute folding may receive a source timestamp a little after the
 // live freshness boundary.  Keep this separate from STALE_SEC: live quotes,
@@ -166,6 +166,8 @@ export function openAbc(home) {
       from_block INTEGER, to_block INTEGER, collected_at INTEGER NOT NULL,
       source_block INTEGER, close_sqrt TEXT,
       PRIMARY KEY(token, minute));
+    CREATE TABLE IF NOT EXISTS pool_activity(
+      token TEXT PRIMARY KEY, first_probe INTEGER, last_probe INTEGER, last_swap INTEGER, swaps INTEGER, last_block INTEGER);
     CREATE TABLE IF NOT EXISTS stats(key TEXT PRIMARY KEY, value INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS swap_events(
       token TEXT NOT NULL, block INTEGER NOT NULL, log_index INTEGER NOT NULL,
@@ -337,6 +339,68 @@ export function usableStreak(store,token) {
   return {count:mins.length,longest:best};
 }
 
+// Broad activity evidence costs one log range, rather than one request per pool.
+export async function probePoolActivity(store,block,io={}) {
+  const logs=await rpcTimeout(()=>client.getLogs({address:A.manager,event:swapEvent,
+    fromBlock:block.number>899n?block.number-899n:0n,toBlock:block.number,strict:true}),
+    rpcBudgetMs(io),'discovery activity',io);
+  const counts=new Map();
+  for(const log of logs) counts.set(log.args.id.toLowerCase(),(counts.get(log.args.id.toLowerCase())||0)+1);
+  const now=Number(block.timestamp);
+  const upsert=store.db.prepare(`INSERT INTO pool_activity VALUES(?,?,?,?,?,?) ON CONFLICT(token) DO UPDATE SET
+    first_probe=CASE WHEN excluded.last_block-899>COALESCE(pool_activity.last_block,0)+1 THEN excluded.first_probe ELSE pool_activity.first_probe END,
+    last_block=excluded.last_block,last_probe=excluded.last_probe,last_swap=COALESCE(excluded.last_swap,pool_activity.last_swap),swaps=excluded.swaps`);
+  store.db.exec('BEGIN');
+  try {
+    for(const row of store.db.prepare("SELECT token,pool_id FROM pools WHERE quote_status='ok'").all()) {
+      if(!row.pool_id) continue; // Unknown pool identity is not evidence of inactivity.
+      const count=counts.get(row.pool_id.toLowerCase())||0;
+      upsert.run(row.token,now,now,count?now:null,count,Number(block.number));
+    }
+    store.db.exec('COMMIT');
+  } catch(error) {store.db.exec('ROLLBACK');throw error;}
+  return {at:now,logs:logs.length,pools:counts.size};
+}
+function watchRole(slot) {return slot===1?'B':slot===3?'A':'C';}
+function activityIdle(store,token,now) {
+  const a=store.db.prepare('SELECT * FROM pool_activity WHERE token=?').get(token);
+  return a&&now/1000-a.last_probe<=120&&now/1000-Math.max(a.first_probe,a.last_swap||0)>=1800;
+}
+export function ensureRoleWatchSlots(store,now=Date.now(),n=LIVE_WATCH_N) {
+  const rows=store.db.prepare("SELECT p.*,a.last_swap,a.swaps FROM pools p LEFT JOIN pool_activity a USING(token) WHERE quote_status='ok'").all();
+  const byToken=new Map(rows.map(r=>[r.token,r]));
+  for(const slot of store.db.prepare("SELECT * FROM watch_slots WHERE COALESCE(status,'ACTIVE')='ACTIVE'").all()) {
+    const p=byToken.get(slot.token),grad=p&&graduationTs(p),role=watchRole(slot.slot);
+    const age=grad==null?null:now/1000-grad;
+    const expired=role==='C'?(age==null||age>=6*3600):now>=slot.seated_at+WATCH_MAX_MS;
+    const idle=now-slot.seated_at>=(role==='C'?30:120)*60000&&activityIdle(store,slot.token,now);
+    if(expired||idle) {
+      const reason=expired?'WATCH_ROLE_EXPIRED':'WATCH_OBSERVED_INACTIVE_30M';
+      store.db.exec('BEGIN');
+      try {archiveSlot(store,slot,now,reason);store.db.prepare('UPDATE watch_slots SET status=? WHERE slot=?').run(reason,slot.slot);store.db.exec('COMMIT');}
+      catch(e){store.db.exec('ROLLBACK');throw e;}
+    }
+  }
+  const active=store.db.prepare("SELECT * FROM watch_slots WHERE COALESCE(status,'ACTIVE')='ACTIVE'").all();
+  const occupied=new Set(active.map(s=>s.slot)),tokens=new Set(active.map(s=>s.token));
+  for(let slot=1;slot<=n;slot++) {
+    if(occupied.has(slot)) continue;
+    const role=watchRole(slot);
+    const eligible=rows.filter(p=>{
+      const grad=graduationTs(p),age=grad==null?-1:now/1000-grad;
+      return !tokens.has(p.token)&&!activityIdle(store,p.token,now)&&
+        (role==='C'?age>=0&&age<5.5*3600:role==='B'?age>=22*3600:age>=2*3600);
+    }).sort((a,b)=>(b.last_swap||0)-(a.last_swap||0)||(b.swaps||0)-(a.swaps||0)||graduationTs(b)-graduationTs(a)||a.token.localeCompare(b.token));
+    const p=eligible[0];if(!p) continue;
+    const exp=role==='C'?(graduationTs(p)+6*3600)*1000:now+WATCH_MAX_MS;
+    store.db.prepare(`INSERT INTO watch_slots VALUES(?,?,?,?,'ACTIVE') ON CONFLICT(slot) DO UPDATE SET
+      token=excluded.token,seated_at=excluded.seated_at,expires_at=excluded.expires_at,status='ACTIVE'`).run(slot,p.token,now,exp);
+    tokens.add(p.token);
+  }
+  const live=store.db.prepare("SELECT p.*,w.slot _slot,w.seated_at _seated_at,w.expires_at _expires_at FROM watch_slots w JOIN pools p USING(token) WHERE COALESCE(w.status,'ACTIVE')='ACTIVE' ORDER BY slot").all();
+  return {live,n,catalog_ok:rows.length,note:'Finite watch: slot 1 B, slot 3 A, slots 2/4 C; inactive rotation requires observed coverage; held positions retained separately'};
+}
+
 export function watchSlotDecision(store,slot,now=Date.now()) {
   const maxEnd=Number(slot.seated_at)+WATCH_MAX_MS;
   const streak=usableStreak(store,slot.token);
@@ -461,18 +525,23 @@ export async function syncCatalog(store,block,io={}) {
     writeRun(store,run);
     return {added:0,from:String(block.number),to:String(block.number),seeded:true};
   }
-  const cursor=BigInt(run.catalog_cursor);
+  const cursorKey=io.liveCatalog?'catalog_live_cursor':'catalog_cursor';
+  if(io.liveCatalog&&run[cursorKey]==null) {
+    run.catalog_live_start=String(block.number>900n?block.number-900n:0n);
+    run[cursorKey]=run.catalog_live_start;
+  }
+  const cursor=BigInt(run[cursorKey]);
   if(cursor>=block.number) return {added:0,from:String(cursor),to:String(block.number)};
   const start=cursor+1n;
-  const catalogCap=start+CATALOG_MAX_BLOCKS-1n>block.number?block.number:start+CATALOG_MAX_BLOCKS-1n;
+  const catalogCap=start+(io.catalogMaxBlocks??CATALOG_MAX_BLOCKS)-1n>block.number?block.number:start+(io.catalogMaxBlocks??CATALOG_MAX_BLOCKS)-1n;
   let added=0;
   for(let from=start;from<=catalogCap;from+=LOG_CHUNK) {
     if(io.deadline&&Date.now()>io.deadline) break;
     const to=from+LOG_CHUNK-1n>catalogCap?catalogCap:from+LOG_CHUNK-1n;
     let registered,graduated;
     try {
-      registered=await rpcRetry((ms)=>rpcTimeout(client.getLogs({address:A.hook,event:hookAbi.find(a=>a.name==='PoolRegistered'),fromBlock:from,toBlock:to,strict:true}),ms,`eth_getLogs PoolRegistered ${from}-${to}`,io),io);
-      graduated=await rpcRetry((ms)=>rpcTimeout(client.getLogs({address:A.factory,event:factoryAbi.find(a=>a.name==='PoolGraduated'),fromBlock:from,toBlock:to,strict:true}),ms,`eth_getLogs PoolGraduated ${from}-${to}`,io),io);
+      registered=await rpcRetry((ms)=>rpcTimeout(()=>client.getLogs({address:A.hook,event:hookAbi.find(a=>a.name==='PoolRegistered'),fromBlock:from,toBlock:to,strict:true}),ms,`eth_getLogs PoolRegistered ${from}-${to}`,io),io);
+      graduated=await rpcRetry((ms)=>rpcTimeout(()=>client.getLogs({address:A.factory,event:factoryAbi.find(a=>a.name==='PoolGraduated'),fromBlock:from,toBlock:to,strict:true}),ms,`eth_getLogs PoolGraduated ${from}-${to}`,io),io);
     } catch(error) {
       store.bump(classifyError(error));
       throw error;
@@ -489,7 +558,7 @@ export async function syncCatalog(store,block,io={}) {
     for(const log of registered) {
       const token=getAddress(log.args.memecoin);
       const quote=getAddress(log.args.quoteToken);
-      const ts=await blockTs(store,log.blockNumber);
+      const ts=await rpcTimeout(()=>blockTs(store,log.blockNumber),rpcBudgetMs(io),'catalog block timestamp',io);
       const supported=same(quote,zeroAddress)||same(quote,A.usdg);
       if(!supported) store.bump('UNSUPPORTED_QUOTE');
       upsert.run(token,log.args.poolId,quote.toLowerCase(),Number(log.blockNumber),ts,null,null,
@@ -498,7 +567,7 @@ export async function syncCatalog(store,block,io={}) {
     }
     for(const log of graduated) {
       const token=getAddress(log.args.token);
-      const ts=await blockTs(store,log.blockNumber);
+      const ts=await rpcTimeout(()=>blockTs(store,log.blockNumber),rpcBudgetMs(io),'catalog block timestamp',io);
       const row=store.db.prepare('SELECT token FROM pools WHERE token=?').get(token);
       if(!row) {
         upsert.run(token,null,null,null,null,Number(log.blockNumber),ts,Number(log.blockNumber),ts,Number(log.blockNumber)-1,'ok');
@@ -508,10 +577,10 @@ export async function syncCatalog(store,block,io={}) {
           .run(Number(log.blockNumber),ts,token);
       }
     }
-    run.catalog_cursor=String(to);
+    run[cursorKey]=String(to);
     writeRun(store,run);
   }
-  return {added,from:String(start),to:String(block.number)};
+  return {added,from:String(start),to:run[cursorKey],head:String(block.number),live:!!io.liveCatalog};
 }
 
 export function graduationTs(row) {
@@ -527,11 +596,12 @@ export function loadBuckets(store,token,fromMinute,toMinute) {
 }
 
 export async function rpcTimeout(promise,ms,label,io) {
+  if(ms<=0) throw new Error('RPC_DEADLINE '+label);
   let timer;
   const epoch=io&&io.rpcEpoch;
   try {
     return await Promise.race([
-      promise,
+      typeof promise==='function'?withRpcDeadline(promise,ms,label):promise,
       new Promise((_,reject)=>{timer=setTimeout(()=>{
         if(io&&io.rpcEpoch===epoch) io.rpcEpoch=(io.rpcEpoch||0)+1;
         reject(new Error('RPC_TIMEOUT '+label));
@@ -631,9 +701,9 @@ export async function enrichPool(store,token,blockNumber) {
 export async function collectBuckets(store,row,pool,block,rates,io={}) {
   const token=row.token;
   if(io.rpcEpoch==null) io.rpcEpoch=0;
-  const getLogsRaw=io.getLogs||((args,ms)=>rpcTimeout(client.getLogs(args),ms,`eth_getLogs ${args.event?.name||'logs'} ${args.fromBlock}-${args.toBlock}`,io));
+  const getLogsRaw=io.getLogs||((args,ms)=>rpcTimeout(()=>client.getLogs(args),ms,`eth_getLogs ${args.event?.name||'logs'} ${args.fromBlock}-${args.toBlock}`,io));
   const getLogs=(args)=>rpcRetry((ms)=>getLogsRaw(args,ms),io);
-  const tsOf=io.blockTs||((n)=>rpcRetry((ms)=>rpcTimeout(blockTs(store,n,io),ms,`eth_getBlockByNumber ${n}`,io),io));
+  const tsOf=io.blockTs||((n)=>rpcRetry((ms)=>rpcTimeout(()=>blockTs(store,n,io),ms,`eth_getBlockByNumber ${n}`,io),io));
   const eventCursor=row.last_event_block!=null?row.last_event_block:row.last_cursor_block;
   const from=BigInt(eventCursor)+1n;
   if(from>block.number) {
@@ -711,7 +781,7 @@ export async function foldStoredEvents(store,row,pool,block,rates,io={}) {
   const tsOf=io.blockTs||((n)=>{
     const ms=rpcBudgetMs(io);
     if(ms<=0) return Promise.reject(new Error('RPC_DEADLINE eth_getBlockByNumber'));
-    return rpcTimeout(blockTs(store,n,io),ms,`eth_getBlockByNumber ${n}`,io);
+    return rpcTimeout(()=>blockTs(store,n,io),ms,`eth_getBlockByNumber ${n}`,io);
   });
   const firstWatch=row.live_from_ts||row.first_seen_ts||Number(block.timestamp);
   if(row.last_event_block==null) throw new Error('SOURCE_UNAVAILABLE coverage_boundary_missing');
@@ -892,8 +962,8 @@ export function pickQueue(store,limit,held) {
   return ensureWatchSlots(store).live;
 }
 
-export function pickLiveWatch(store,held=[],n=LIVE_WATCH_N) {
-  const watch=ensureWatchSlots(store,Date.now(),n);
+export function pickLiveWatch(store,held=[],n=LIVE_WATCH_N,now=Date.now()) {
+  const watch=n>=4?ensureRoleWatchSlots(store,now,n):ensureWatchSlots(store,now,n);
   const heldRows=held.map(t=>store.db.prepare('SELECT * FROM pools WHERE token=?').get(t)).filter(Boolean);
   const seen=new Set(watch.live.map(r=>r.token.toLowerCase()));
   const extra=heldRows.filter(r=>!seen.has(r.token.toLowerCase()));
@@ -904,7 +974,7 @@ export async function skipBacklogForLive(store,row,block,io={}) {
   const tsOf=io.blockTs||((n)=>{
     const ms=rpcBudgetMs(io);
     if(ms<=0) return Promise.reject(new Error('RPC_DEADLINE eth_getBlockByNumber'));
-    return rpcTimeout(blockTs(store,n,io),ms,`eth_getBlockByNumber ${n}`,io);
+    return rpcTimeout(()=>blockTs(store,n,io),ms,`eth_getBlockByNumber ${n}`,io);
   });
   const cur=BigInt(row.last_event_block!=null?row.last_event_block:row.last_cursor_block||0);
   const lag=block.number-cur;

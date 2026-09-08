@@ -4,7 +4,7 @@ import {ROOT,client,save,failure,logRpcHealth,warmHolderHistory} from './chain.m
 import {broadcast,enabled} from './telegram.mjs';
 import {
   abcDir,openAbc,initAccounts,readAccount,writeAccount,readRun,writeRun,
-  syncCatalog,graduationTs,loadBuckets,
+  syncCatalog,graduationTs,loadBuckets,probePoolActivity,
   enrichPool,collectBuckets,catalogStats,assertFreshness,
   ANALYZE_LIMIT,CYCLE_TARGET_MS,DEFAULT_HOURS,STRATEGY_VERSION,
   classifyError,blockContext,usdRates,stringify,usdSourceAge,STALE_SEC,
@@ -100,6 +100,11 @@ export async function sleepUntil(deadline,shouldStop,stepMs=50) {
   while(Date.now()<deadline&&!(shouldStop&&shouldStop())) await new Promise(r=>setTimeout(r,stepMs));
 }
 
+function isTransientEntry(result) {
+  const reasons=[result.skipped,...(result.safety?.reasons||[])].filter(Boolean).join(' ');
+  return /SOURCE_UNAVAILABLE|RPC_TIMEOUT|RPC_DEADLINE|timed out|timeout|429|HOLDER_HISTORY_INCOMPLETE|HOLDER_HISTORY_WARMUP|HOLDER_HISTORY_DEADLINE/i.test(reasons);
+}
+
 export async function cycle(store,now=Date.now(),io={}) {
   const t0=Date.now();
   ensureScreeningSchema(store);
@@ -119,7 +124,16 @@ export async function cycle(store,now=Date.now(),io={}) {
   const collectDeadline=io.deadline|| (t0+(io.collectBudgetMs??COLLECT_BUDGET_MS));
   Object.assign(run,readRun(store),{status:run.status,last_started_at:run.last_started_at,code_version:CODE_VERSION,exits_ms:run.exits_ms});
   const ending=now>=run.ends_at||existsSync(resolve(store.dir,'stop.json'));
-  const watch=pickLiveWatch(store,held,io.liveWatchN??LIVE_WATCH_N);
+  // Live discovery has its own deadline; historical catch-up retains its old cursor.
+  let catalog={added:0};
+  if(!io.skipCatalog) {
+    try {
+      catalog=await (io.syncCatalog||syncCatalog)(store,block,{...io,liveCatalog:true,catalogMaxBlocks:6000n,deadline:Math.min(collectDeadline,Date.now()+8000)});
+      if(!io.syncCatalog&&!io.blockContext&&Date.now()+1000<collectDeadline)
+        run.discovery_activity=await probePoolActivity(store,block,{deadline:Math.min(collectDeadline,Date.now()+4000)});
+    } catch(error) {run.last_pool_error={token:null,error:failure(error),kind:classifyError(error),at:Date.now()};}
+  }
+  const watch=pickLiveWatch(store,held,io.liveWatchN??LIVE_WATCH_N,now);
   run.live_watch={n:watch.n,catalog_ok:watch.catalog_ok,tokens:watch.live.map(r=>r.token),note:watch.note};
   // Alternate the first unheld slot so catch-up cannot monopolize the shared budget.
   const queue=(run.rounds||0)%2?[...watch.live].reverse():watch.live;
@@ -144,58 +158,87 @@ export async function cycle(store,now=Date.now(),io={}) {
       const buckets=loadBuckets(store,row.token,lastComplete-8*3600,lastComplete+60);
       for(const strat of ['A','B','C']) {
         const acc=accounts[strat];
-        const prev=acc.signal_state[row.token]||null;
-        const ev=evaluators[strat](buckets,prev,grad,lastComplete);
-        acc.signal_state[row.token]=ev.persist;
-        if(ev.reason) {
-          // Keep aggregate NO_T (and other reasons) exactly as before for reject_counts compatibility
-          acc.reject_counts[ev.reason]=(acc.reject_counts[ev.reason]||0)+1;
-          if(String(ev.reason).startsWith('WARMUP')) warmup[strat]++;
+        acc.pending_signals??={};
+        const pending=acc.pending_signals[row.token];
+        if(pending) {
+          if(now<pending.expires_at&&!ending) {
+            const result=await tryEnter(store,acc,row.token,pending.signal,pool,block,rates,gasPrice,now,io);
+            Object.assign(acc,readAccount(store,acc.strategy));
+            signals.push({strategy:strat,token:row.token,minute:pending.signal.minute,result:slimSignalResult(result),retry:true});
+            if(!io.skipScreeningRecord) recordEvalFromCycle(store,{strategy:strat,token:row.token,minute:pending.signal.minute,
+              ev:{signal:pending.signal,persist:acc.signal_state[row.token]},gradTs:grad,watched:true,buckets,pool,
+              safety:{...(result.safety||{}),plan:result.plan||null},paperFilled:!!result.filled,codeVersion:CODE_VERSION});
+            if(result.filled||!isTransientEntry(result)) delete acc.pending_signals[row.token];
+          } else delete acc.pending_signals[row.token];
+          writeAccount(store,acc);
         }
-        writeAccount(store,acc);
-        let enterResult=null;
-        if(ev.signal&&!ending) {
-          const result=await tryEnter(store,acc,row.token,ev.signal,pool,block,rates,gasPrice,now,io);
-          enterResult=result;
-          Object.assign(acc,readAccount(store,acc.strategy));
-          signals.push({strategy:strat,token:row.token,minute:ev.signal.minute,result:slimSignalResult(result)});
-        }
-        // Diagnose-only unique eval row; does not gate buys
-        try {
-          if(!io.skipScreeningRecord) {
-            recordEvalFromCycle(store,{
-              strategy:strat,token:row.token,minute:lastComplete,ev,gradTs:grad,watched:true,
-              buckets,pool,safety:enterResult?{...(enterResult.safety||{}),plan:enterResult.plan||null}:null,
-              paperFilled:!!(enterResult&&enterResult.filled),
-              codeVersion:CODE_VERSION,
-            });
+        acc.evaluated_minutes??={};
+        const previousMinute=acc.evaluated_minutes[row.token];
+        // Migration starts at the next current minute, never replays old account state backwards.
+        const from=previousMinute==null?lastComplete:previousMinute+60;
+        for(let evalMinute=from;evalMinute<=lastComplete;evalMinute+=60) {
+          let prev=acc.signal_state[row.token]||null;
+          const present=buckets.some(b=>b.minute===evalMinute);
+          // A declared missing minute breaks a causal multi-minute setup.
+          if(!present) prev=null;
+          const ev=evaluators[strat](buckets,prev,grad,evalMinute);
+          if(!present) ev.persist=null;
+          acc.evaluated_minutes[row.token]=evalMinute;
+          acc.signal_state[row.token]=ev.persist;
+          if(ev.reason) {
+            // Keep aggregate NO_T (and other reasons) exactly as before for reject_counts compatibility
+            acc.reject_counts[ev.reason]=(acc.reject_counts[ev.reason]||0)+1;
+            if(String(ev.reason).startsWith('WARMUP')) warmup[strat]++;
           }
-        } catch(screenErr) {
-          run.last_screening_error=failure(screenErr);
+          const shouldEnter=ev.signal&&!ending&&evalMinute===lastComplete&&!acc.pending_signals[row.token];
+          if(shouldEnter) acc.pending_signals[row.token]={signal:ev.signal,expires_at:(ev.signal.minute+180)*1000};
+          // Commit both the minute cursor and pending intent before network I/O.
+          writeAccount(store,acc);
+          let enterResult=null;
+          if(shouldEnter) {
+            const result=await tryEnter(store,acc,row.token,ev.signal,pool,block,rates,gasPrice,now,io);
+            enterResult=result;
+            Object.assign(acc,readAccount(store,acc.strategy));
+            if(result.filled||!isTransientEntry(result)) delete acc.pending_signals[row.token];
+            writeAccount(store,acc);
+            signals.push({strategy:strat,token:row.token,minute:ev.signal.minute,result:slimSignalResult(result)});
+          }
+          // Diagnose-only unique eval row; does not gate buys
+          try {
+            if(!io.skipScreeningRecord) {
+              recordEvalFromCycle(store,{
+                strategy:strat,token:row.token,minute:evalMinute,ev,gradTs:grad,watched:true,
+                buckets,pool,safety:enterResult?{...(enterResult.safety||{}),plan:enterResult.plan||null}:null,
+                paperFilled:!!(enterResult&&enterResult.filled),
+                codeVersion:CODE_VERSION,
+              });
+            }
+          } catch(screenErr) {
+            run.last_screening_error=failure(screenErr);
+          }
         }
       }
       analyzed.push(row.token);
     } catch(error) {
       const kind=classifyError(error);
       store.bump(kind);
-      run.last_pool_error={token:row.token,error:failure(error),kind};
+      run.last_pool_error={token:row.token,error:failure(error),kind,at:Date.now()};
     } finally {
       store.db.prepare('UPDATE pools SET last_analyzed_at=? WHERE token=?').run(now,row.token);
     }
   }
-  let catalog={added:0};
-  if(!io.skipCatalog&&Date.now()<collectDeadline) {
-    try {catalog=await (io.syncCatalog||syncCatalog)(store,block,rpcIo);}
-    catch(error) {run.last_pool_error={token:null,error:failure(error),kind:classifyError(error)};}
+  if(!io.skipCatalog&&!io.syncCatalog) {
+    try {run.catalog_backfill=await syncCatalog(store,block,{...io,catalogMaxBlocks:6000n,deadline:Math.min(t0+53000,Date.now()+8000)});}
+    catch(error) {run.last_pool_error={token:null,error:failure(error),kind:classifyError(error),at:Date.now()};}
   }
   // Warm one watch's full holder history after price collection and catalog.
   // Injected offline collectors never make this extra network request.
-  if(!io.collectBuckets&&!io.blockContext&&watch.live.length&&Date.now()+5000<collectDeadline) {
+  if(!io.collectBuckets&&!io.blockContext&&watch.live.length&&Date.now()+2500<t0+58000) {
     const row=watch.live[(run.rounds||0)%watch.live.length];
     try {
       const h=await warmHolderHistory(row.token,block.number,{
         birthUpper:row.registered_block??row.first_seen_block,
-        deadline:Math.min(collectDeadline-4000,Date.now()+12000),maxChunks:8,
+        deadline:Math.min(t0+57000,Date.now()+12000),maxChunks:8,
       });
       run.holder_history={token:row.token,complete:h.complete,stage:h.stage,cursor:h.cursor,at:Date.now()};
     } catch(e) {run.holder_history={token:row.token,error:failure(e),at:Date.now()};}
@@ -203,7 +246,7 @@ export async function cycle(store,now=Date.now(),io={}) {
   Object.assign(run,readRun(store),{
     status:run.status,last_started_at:run.last_started_at,code_version:CODE_VERSION,exits_ms:run.exits_ms,
     live_watch:run.live_watch,last_pool_error:run.last_pool_error,
-    holder_history:run.holder_history,
+    holder_history:run.holder_history,discovery_activity:run.discovery_activity,catalog_backfill:run.catalog_backfill,
   });
   // Apply this cycle's FX diagnostics after merging persisted collector state.
   run.usd_source_age_sec=usdSourceAge(rates,now/1000);
@@ -278,7 +321,7 @@ export async function worker(hours,foreground=false) {
       delete run.finished_at;delete run.unclosed;
     }
     writeRun(store,run);save(resolve(dir,'status.json'),run);
-    await notifySafe(run,`start:${run.started_at}`,`▶️ ABC PAPER 模拟（非实盘）已启动\n时长至 ${new Date(run.ends_at).toISOString()}\n固定观察槽 ${LIVE_WATCH_N} 个、最长保留36h（毕业+24h后再观察2h），不是全目录。不签名、不广播。`);
+    await notifySafe(run,`start:${run.started_at}`,`▶️ ABC PAPER 模拟（非实盘）已启动\n时长至 ${new Date(run.ends_at).toISOString()}\n分策略观察槽 ${LIVE_WATCH_N} 个：A/B 与年轻 C 分开，按已观测活跃度轮换，不是全目录。不签名、不广播。`);
     let lastExitStart=null;
     while(!stopping&&Date.now()<run.ends_at&&!existsSync(resolve(dir,'stop.json'))) {
       run=readRun(store);

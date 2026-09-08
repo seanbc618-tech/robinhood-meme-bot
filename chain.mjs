@@ -1,3 +1,4 @@
+import {AsyncLocalStorage} from 'node:async_hooks';
 import { createPublicClient, http, parseAbi, parseAbiParameters, encodeAbiParameters,
   encodeFunctionData, decodeFunctionResult, decodeEventLog, keccak256, zeroAddress, custom,
   parseUnits, formatUnits, toFunctionSelector, getAddress } from 'viem';
@@ -34,17 +35,53 @@ export const A = {
   permit2: '0x000000000022d473030f116ddee9f6b43ac78ba3',
   usdg: '0x5fc5360d0400a0fd4f2af552add042d716f1d168',
 };
-const readTransport = http(
+// A deadline follows the whole fallback chain, including queued requests.
+const rpcScope=new AsyncLocalStorage();
+export async function withRpcDeadline(fn,ms,label) {
+  if(ms<=0) throw new Error('RPC_DEADLINE '+label);
+  const controller=new AbortController();
+  const parent=rpcScope.getStore();
+  const signal=parent?AbortSignal.any([parent,controller.signal]):controller.signal;
+  const timer=setTimeout(()=>controller.abort(new Error('RPC_TIMEOUT '+label)),ms);
+  try {return await rpcScope.run(signal,fn);} finally {clearTimeout(timer);}
+}
+const rpcQueues=new Map();
+function scopedFetch(url,options={}) {
+  const scope=rpcScope.getStore();
+  const signal=scope?AbortSignal.any([scope,...(options.signal?[options.signal]:[])]):options.signal;
+  const key=new URL(url).origin;
+  let q=rpcQueues.get(key);
+  if(!q) {q={tail:Promise.resolve(),next:0};rpcQueues.set(key,q);}
+  const request=q.tail.then(async()=>{
+    signal?.throwIfAborted();
+    const wait=Math.max(0,q.next-Date.now());
+    if(wait) await new Promise((resolve,reject)=>{
+      const abort=()=>{clearTimeout(timer);reject(signal.reason);};
+      const timer=setTimeout(()=>{signal?.removeEventListener('abort',abort);resolve();},wait);
+      signal?.addEventListener('abort',abort,{once:true});
+    });
+    signal?.throwIfAborted();
+    q.next=Date.now()+(key.includes('quiknode')?1200:250);
+    // Consume the body before releasing the queue, not just the HTTP headers.
+    const response=await fetch(url,{...options,signal});
+    const body=await response.arrayBuffer();
+    return new Response(body,{status:response.status,statusText:response.statusText,headers:response.headers});
+  });
+  q.tail=request.catch(()=>{});
+  return request;
+}
+function rpcHttp(url,options={}) {return http(url,{...options,fetchFn:scopedFetch});}
+const readTransport = rpcHttp(
   process.env.ROBINHOOD_RPC_URL || 'https://rpc.mainnet.chain.robinhood.com',
-  { retryCount: 0, timeout: 20000, fetchOptions: { headers: { 'User-Agent': 'rh-dog-bot/0.2' } } })({});
-const logTransport=http(process.env.ROBINHOOD_LOG_RPC_URL || 'https://rpc.mainnet.chain.robinhood.com',{
-  retryCount:0,timeout:8000,fetchOptions:{headers:{'User-Agent':'rh-dog-bot/0.2'}}
+  { retryCount: 0, timeout: 6000, fetchOptions: { headers: { 'User-Agent': 'rh-dog-bot/0.2' } } })({});
+const logTransport=rpcHttp(process.env.ROBINHOOD_LOG_RPC_URL || 'https://rpc.mainnet.chain.robinhood.com',{
+  retryCount:0,timeout:2500,fetchOptions:{headers:{'User-Agent':'rh-dog-bot/0.2'}}
 })({});
 const alchemyLogTransport=process.env.ROBINHOOD_RPC_URL
-  ?http(process.env.ROBINHOOD_RPC_URL,{retryCount:0,timeout:6000,fetchOptions:{headers:{'User-Agent':'rh-dog-bot/0.2'}}})({})
+  ?rpcHttp(process.env.ROBINHOOD_RPC_URL,{retryCount:0,timeout:6000,fetchOptions:{headers:{'User-Agent':'rh-dog-bot/0.2'}}})({})
   :null;
 const backupLogTransport=process.env.ROBINHOOD_TRACE_RPC_URL
-  ?http(process.env.ROBINHOOD_TRACE_RPC_URL,{retryCount:0,timeout:4000})({}):null;
+  ?rpcHttp(process.env.ROBINHOOD_TRACE_RPC_URL,{retryCount:0,timeout:4000})({}):null;
 let backupLogsUntil=0;
 let solidDisabledUntil=0;
 const ALCHEMY_LOG_CHUNK=10n;
@@ -52,6 +89,7 @@ const ALCHEMY_MAX_FALLBACK_RANGE=900n;
 const PUBLIC_LOG_MIN_INTERVAL_MS=150;
 const ALCHEMY_LOG_RETRIES=2;
 let publicNextAt=0;
+let publicDisabledUntil=0;
 function extraLogConfig() {
   return String(process.env.ROBINHOOD_LOG_RPC_URLS||'').split(',').map((item,index)=>{
     const at=item.indexOf('|');
@@ -66,7 +104,7 @@ function extraLogConfig() {
   }).filter(Boolean);
 }
 const extraLogTransports=extraLogConfig().map(entry=>({...entry,
-  transport:http(entry.url,{retryCount:0,timeout:10000,fetchOptions:{headers:{'User-Agent':'rh-dog-bot/0.2'}}})({}),
+  transport:rpcHttp(entry.url,{retryCount:0,timeout:10000,fetchOptions:{headers:{'User-Agent':'rh-dog-bot/0.2'}}})({}),
   nextAt:0,
 }));
 export const logRpcHealth={public_failures:0,backup_successes:0,alchemy_successes:0,slow_successes:0,solid_quota_exhausted:0,last_failure:null,last_provider:null};
@@ -78,7 +116,7 @@ function safeErrorText(error) {
   return errorText(error).replace(/https?:\/\/[^\s]+/g,'[RPC URL redacted]')
     .replace(/(?:ak_|alch_)[a-zA-Z0-9_-]+/g,'[key redacted]').slice(0,180);
 }
-function quotaError(error) { return /402|quota|daily.?response.?quota|too many requests/i.test(errorText(error)); }
+function quotaError(error) { return /402|daily.?response.?quota|quota (?:exceeded|exhausted)/i.test(errorText(error)); }
 function nextUtcReset() {
   const d=new Date(); d.setUTCHours(24,0,0,0); return d.getTime();
 }
@@ -133,7 +171,7 @@ async function logRequest(args) {
   const preferSolid=backupLogTransport&&now<backupLogsUntil&&now>=solidDisabledUntil;
   const providers=[];
   if(preferSolid) providers.push(['solid',backupLogTransport]);
-  providers.push(['public',{request:publicLogRequest}]);
+  if(now>=publicDisabledUntil) providers.push(['public',{request:publicLogRequest}]);
   if(!preferSolid&&backupLogTransport&&now>=solidDisabledUntil) providers.push(['solid',backupLogTransport]);
   for(const entry of extraLogTransports) {
     if(entry.maxRange!=null&&range!=null&&range>BigInt(entry.maxRange)) continue;
@@ -142,6 +180,7 @@ async function logRequest(args) {
   if(alchemyLogTransport&&(range==null||range<=ALCHEMY_MAX_FALLBACK_RANGE)) providers.push(['alchemy',{request:alchemyLogRequest}]);
   let last;
   for(const [provider,transport] of providers) {
+    rpcScope.getStore()?.throwIfAborted();
     try {
       const result=await transport.request(args);
       if(provider==='solid') logRpcHealth.backup_successes++;
@@ -150,10 +189,12 @@ async function logRequest(args) {
       logRpcHealth.last_provider=provider;
       return result;
     } catch(error) {
+      rpcScope.getStore()?.throwIfAborted();
       last=error;noteLogFailure(provider,error,args);
       if(provider==='public') {
         logRpcHealth.public_failures++;
         backupLogsUntil=Date.now()+300000;
+        publicDisabledUntil=backupLogsUntil;
       }
       if(provider==='solid'&&quotaError(error)) {
         solidDisabledUntil=nextUtcReset();
@@ -163,9 +204,19 @@ async function logRequest(args) {
   }
   throw last||new Error('RPC_LOG_UNAVAILABLE');
 }
+async function readRequest(args) {
+  // Discover's five-block limit applies to logs, not contract/block reads.
+  const dedicated=extraLogTransports.filter(p=>p.maxRange!=null);
+  let last;
+  for(const transport of [readTransport,...dedicated.map(p=>p.transport)]) {
+    rpcScope.getStore()?.throwIfAborted();
+    try {return await transport.request(args);} catch(error) {last=error;}
+  }
+  throw last;
+}
 export const client=createPublicClient({transport:custom({request:args=>
-  args.method==='eth_getLogs'?logRequest(args):readTransport.request(args)}, {retryCount:0})});
-export const traceClient=createPublicClient({transport:http(
+  args.method==='eth_getLogs'?logRequest(args):readRequest(args)}, {retryCount:0})});
+export const traceClient=createPublicClient({transport:rpcHttp(
   process.env.ROBINHOOD_TRACE_RPC_URL || process.env.ROBINHOOD_RPC_URL || 'https://rpc.mainnet.chain.robinhood.com',
   {retryCount:0,timeout:30000})});
 export const erc20 = parseAbi([
@@ -195,7 +246,7 @@ export function save(path, data) {
   writeFileSync(path + '.tmp', stringify(data) + '\n'); renameSync(path + '.tmp', path);
 }
 export function failure(error) {
-  return String(error.shortMessage || error.message).replace(/https?:\/\/[^\s]+/g,'[RPC URL redacted]')
+  return [error.shortMessage||error.message,error.details,error.cause?.message].filter(Boolean).join(' ').replace(/https?:\/\/[^\s]+/g,'[RPC URL redacted]')
     .replace(/(?:ak_|alch_)[a-zA-Z0-9_-]+/g,'[key redacted]').slice(0,400);
 }
 export function requireValue(ok, message) { if (!ok) throw new Error(message); }
@@ -349,7 +400,7 @@ export async function blockAtTime(timestamp, head) {
 }
 export async function warmHolderHistory(token,blockNumber,options={}) {
   return transferHistory(client,erc20.find(a=>a.name==='Transfer'),token,blockNumber,{
-    path:resolve(ROOT,'data/holder-history.sqlite'),...options,
+    path:process.env.HOLDER_HISTORY_PATH||resolve(ROOT,'data/holder-history.sqlite'),request:withRpcDeadline,...options,
   });
 }
 export async function holderData(pool, blockNumber) {
