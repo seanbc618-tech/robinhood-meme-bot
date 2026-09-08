@@ -116,9 +116,13 @@ function safeErrorText(error) {
   return errorText(error).replace(/https?:\/\/[^\s]+/g,'[RPC URL redacted]')
     .replace(/(?:ak_|alch_)[a-zA-Z0-9_-]+/g,'[key redacted]').slice(0,180);
 }
-function quotaError(error) { return /402|daily.?response.?quota|quota (?:exceeded|exhausted)/i.test(errorText(error)); }
+function quotaError(error) { return /402|daily.?response.?quota|daily request limit reached|quota (?:exceeded|exhausted)/i.test(errorText(error)); }
 function nextUtcReset() {
   const d=new Date(); d.setUTCHours(24,0,0,0); return d.getTime();
+}
+export function logProviderPauseUntil(error,now=Date.now()) {
+  if(quotaError(error)) {const d=new Date(now);d.setUTCHours(24,0,0,0);return d.getTime();}
+  return /429|too many requests|rate.?limit/i.test(errorText(error))?now+30000:0;
 }
 function noteLogFailure(provider,error,args) {
   const p=args.params?.[0]||{};
@@ -174,6 +178,7 @@ async function logRequest(args) {
   if(now>=publicDisabledUntil) providers.push(['public',{request:publicLogRequest}]);
   if(!preferSolid&&backupLogTransport&&now>=solidDisabledUntil) providers.push(['solid',backupLogTransport]);
   for(const entry of extraLogTransports) {
+    if(now<(entry.disabledUntil||0)) continue;
     if(entry.maxRange!=null&&range!=null&&range>BigInt(entry.maxRange)) continue;
     providers.push([entry.label,{request:args=>extraLogRequest(entry,args)}]);
   }
@@ -191,6 +196,8 @@ async function logRequest(args) {
     } catch(error) {
       rpcScope.getStore()?.throwIfAborted();
       last=error;noteLogFailure(provider,error,args);
+      const extra=extraLogTransports.find(entry=>entry.label===provider);
+      if(extra) extra.disabledUntil=logProviderPauseUntil(error);
       if(provider==='public') {
         logRpcHealth.public_failures++;
         backupLogsUntil=Date.now()+300000;

@@ -19,7 +19,7 @@ import {
 } from './abc.mjs';
 
 import {ensureRoleWatchSlots,syncCatalog} from './abc-collect.mjs';
-import {client as catalogClient} from './chain.mjs';
+import {client as catalogClient,logProviderPauseUntil} from './chain.mjs';
 import {evaluators} from './abc-strategy.mjs';
 const fails=[];
 function assert(name,ok,detail){if(ok) console.log('PASS',name); else {console.log('FAIL',name,detail||'');fails.push(name);}}
@@ -841,6 +841,13 @@ assert('strategy version is v10',STRATEGY_VERSION==='abc-phase1-v10');
     assert('B remains empty when no eligible replacement exists',!empty.live.some(r=>r._slot===1));
     st.close();
   } finally {rmSync(dir,{recursive:true,force:true});}
+}
+
+{
+  const now=Date.UTC(2026,8,8,11,30);
+  assert('daily demo quota pauses until next UTC day',logProviderPauseUntil({details:'daily request limit reached - upgrade your account'},now)===Date.UTC(2026,8,9));
+  assert('transient throttling has short pause only',logProviderPauseUntil({message:'429 too many requests'},now)===now+30000);
+  assert('unrelated source error is not a daily quota',logProviderPauseUntil({message:'invalid filter'},now)===0);
 }
 
 if(fails.length){console.error('FAILED',fails.length,fails.join(','));process.exitCode=1;}
