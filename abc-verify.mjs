@@ -231,11 +231,11 @@ function freshAccount(strategy='A',principal=30,spend=35) {
   const pool={quote:zeroAddress,quoteDecimals:18,token:zeroAddress,key:{currency0:zeroAddress,currency1:zeroAddress}};
   const rates={prices:{ethereum:{usd:2000},'global-dollar':{usd:1},tether:{usd:1}}};
   const gasPrice=1n;
-  const buy={amountOut:10n**18n,quoterGasEstimate:1n};
-  const sellCheap={amountOut:10n**15n,quoterGasEstimate:1n};
+  const buy={amountOut:10n**18n,executionFeeWei:10000000000000n,quoterGasEstimate:1n};
+  const sellCheap={amountOut:10n**15n,executionFeeWei:10000000000000n,quoterGasEstimate:1n};
   const plan=plannedRoundTripFromQuotes(buy,sellCheap,pool,30,10n**18n,rates,gasPrice,50n);
   assert('fee threshold rejects expensive round trip',plan.loss_pct>0.05,plan);
-  const sellOk={amountOut:parseUnitsSafe('0.0149'),quoterGasEstimate:1n};
+  const sellOk={amountOut:parseUnitsSafe('0.0149'),executionFeeWei:10000000000000n,quoterGasEstimate:1n};
 }
 
 function parseUnitsSafe(s) {
@@ -245,8 +245,8 @@ function parseUnitsSafe(s) {
 {
   const pool={quote:zeroAddress,quoteDecimals:18,token:zeroAddress,key:{currency0:zeroAddress,currency1:zeroAddress}};
   const rates={prices:{ethereum:{usd:2000},'global-dollar':{usd:1},tether:{usd:1}}};
-  const buy={amountOut:10n**18n,quoterGasEstimate:21000n};
-  const sell={amountOut:parseUnitsSafe('0.014925'),quoterGasEstimate:21000n};
+  const buy={amountOut:10n**18n,executionFeeWei:10000000000000n,quoterGasEstimate:21000n};
+  const sell={amountOut:parseUnitsSafe('0.014925'),executionFeeWei:10000000000000n,quoterGasEstimate:21000n};
   const plan=plannedRoundTripFromQuotes(buy,sell,pool,30,10n**18n,rates,1n,50n);
   assert('fee model records haircut 50bps',plan.haircut_bps===50&&Number.isFinite(plan.loss_pct),plan);
 }

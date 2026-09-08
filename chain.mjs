@@ -342,7 +342,45 @@ export function tokenDelta(logs, token, wallet) {
   return delta;
 }
 
-export async function roundTrip(pool, amountIn, block, suppliedAccount) {
+const nodeInterfaceAbi=parseAbi(['function gasEstimateL1Component(address to,bool contractCreation,bytes data) payable returns (uint64 gasEstimateForL1,uint256 baseFee,uint256 l1BaseFeeEstimate)']);
+export async function simulationFees(calls,results,block,gasPrice,split=0) {
+  requireValue(calls.length===results.length,'GAS_CALL_COUNT_MISMATCH');
+  let buyWei=0n,sellWei=0n,buyL1Wei=0n,sellL1Wei=0n;const evidence=[];
+  for(let i=0;i<calls.length;i++) {
+    requireValue(results[i].status==='success'&&results[i].gasUsed>0n,'EXECUTION_GAS_UNKNOWN');
+    const {result}=await client.simulateContract({address:'0x00000000000000000000000000000000000000c8',
+      abi:nodeInterfaceAbi,functionName:'gasEstimateL1Component',args:[calls[i].to,false,calls[i].data||'0x'],blockNumber:block.number});
+    const l1Wei=result[0]*result[1],executionWei=results[i].gasUsed*gasPrice;
+    if(i<split) {buyWei+=executionWei+l1Wei;buyL1Wei+=l1Wei;} else {sellWei+=executionWei+l1Wei;sellL1Wei+=l1Wei;}
+    evidence.push({to:calls[i].to,gasUsed:results[i].gasUsed,gasPrice,l1Gas:result[0],l1BaseFee:result[1],executionWei,l1Wei});
+  }
+  return {buyWei,sellWei,buyL1Wei,sellL1Wei,calls:evidence,block:block.number,
+    source:'eth_simulateV1 transaction gas (includes intrinsic) + NodeInterface L1 component; no USD floor'};
+}
+export async function simulateExit(pool,qty,block,gasPrice,candidates=[]) {
+  // Impersonation is read-only simulation, never a transaction or signature.
+  // Use an observed holder's existing token balance; never invent token storage.
+  let account;
+  for(const address of candidates) {
+    const code=await client.getCode({address,blockNumber:block.number});
+    if(code&&code!=='0x') continue;
+    const balance=await client.readContract({address:pool.token,abi:erc20,functionName:'balanceOf',args:[address],blockNumber:block.number});
+    if(balance>=qty) {account=address;break;}
+  }
+  requireValue(account,'EXIT_SIMULATION_HOLDER_UNAVAILABLE');
+  const q=await quoteExact(pool,pool.token,qty,block.number),deadline=block.timestamp+300n;
+  const calls=[...approvals(pool.token,qty,account,deadline),swapCall(pool,pool.token,qty,q.amountOut*9700n/10000n,account,deadline)];
+  const sim=await client.simulateCalls({account,calls,blockNumber:block.number,
+    stateOverrides:[{address:account,balance:parseUnits('1',18)}],traceAssetChanges:true});
+  requireValue(sim.results.every(r=>r.status==='success'),'EXIT_SIMULATION_REVERT');
+  requireValue(-tokenDelta(sim.results.at(-1).logs,pool.token,account)===qty,'EXIT_SIMULATION_QUANTITY_MISMATCH');
+  const delta=sim.assetChanges.find(a=>same(a.token.address,pool.quote)||(pool.quote===zeroAddress&&same(a.token.address,'0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee')));
+  requireValue(delta&&delta.value.diff>0n,'EXIT_SIMULATION_QUOTE_MISSING');
+  const fees=await simulationFees(calls,sim.results,block,gasPrice);
+  return {amountOut:delta.value.diff,executionFeeWei:fees.sellWei,fees,account};
+}
+
+export async function roundTrip(pool, amountIn, block, suppliedAccount, options={}) {
   const account = getAddress(suppliedAccount || '0x00000000000000000000000000000000000a11ce');
   const synthetic = !suppliedAccount;
   requireValue(!synthetic || pool.quote === zeroAddress, 'ERC20_SIMULATION_REQUIRES_FUNDED_ACCOUNT');
@@ -369,8 +407,9 @@ export async function roundTrip(pool, amountIn, block, suppliedAccount) {
   requireValue(quoteChange,'SIMULATED_QUOTE_BALANCE_MISSING');
   const returned = amountIn + quoteChange.value.diff;
   const gasUsed = simulation.results.reduce((a,r)=>a+r.gasUsed,0n);
-  const gasPrice = await client.getGasPrice();
-  return {status:'SIMULATED_NOT_FILLED',account,synthetic_funding:synthetic,block_number:block.number,
+  const gasPrice = options.gasPrice??await client.getGasPrice();
+  const fees=options.withFees?await simulationFees(calls,simulation.results,block,gasPrice,firstCalls.length):null;
+  return {fees,status:'SIMULATED_NOT_FILLED',account,synthetic_funding:synthetic,block_number:block.number,
     amount_in:amountIn,token_received:received,token_sold:sold,quote_returned:returned,
     round_trip_loss_bps:Number((amountIn-returned)*10000n/amountIn),gas_used:gasUsed,
     estimated_execution_gas_wei:gasUsed*gasPrice,gas_note:'execution estimate; future L1 data fee and market movement excluded',

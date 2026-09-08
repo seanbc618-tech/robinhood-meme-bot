@@ -11,7 +11,7 @@ import {
   foldStoredEvents,fxContemporaneous,fxForMinute,skipBacklogForLive,saveFxSnap,ensureWatchSlots,logBlocksNeeded,
   HISTORICAL_FX_STALE_SEC,
   migrateCSize,
-  watchSlotDecision,WATCH_MAX_MS,WATCH_POST_MATURITY_MS,rpcRetry,RPC_CALL_TIMEOUT_MS,
+  modeledGasUsd,watchSlotDecision,WATCH_MAX_MS,WATCH_POST_MATURITY_MS,rpcRetry,RPC_CALL_TIMEOUT_MS,
 } from './abc-collect.mjs';
 import {
   cycle,tryEnter,markAndExit,recomputeEquity,applyBuy,applySell,evaluateB,evaluateC,
@@ -19,7 +19,7 @@ import {
 } from './abc.mjs';
 
 import {ensureRoleWatchSlots,syncCatalog} from './abc-collect.mjs';
-import {client as catalogClient,logProviderPauseUntil} from './chain.mjs';
+import {client as catalogClient,logProviderPauseUntil,simulationFees} from './chain.mjs';
 import {evaluators} from './abc-strategy.mjs';
 const fails=[];
 function assert(name,ok,detail){if(ok) console.log('PASS',name); else {console.log('FAIL',name,detail||'');fails.push(name);}}
@@ -303,7 +303,7 @@ function tmp(){return mkdtempSync(join(tmpdir(),'abc-repair-'));}
     const io={
       now:()=>now,
       safetyScreen:async()=>({ok:true,reasons:[]}),
-      plannedRoundTrip:async()=>({qty:10n,cash_out:30.5,loss_pct:0.01,buyGas:0.5,sellGas:0.5,amountIn:1n,buy:{amountOut:10n,quoterGasEstimate:1n},sell:{amountOut:1n,quoterGasEstimate:1n}}),
+      plannedRoundTrip:async()=>({qty:10n,cash_out:30.5,loss_pct:0.01,buyGas:0.5,sellGas:0.5,amountIn:1n,buy:{amountOut:10n,executionFeeWei:10000000000000n,quoterGasEstimate:1n},sell:{amountOut:1n,executionFeeWei:10000000000000n,quoterGasEstimate:1n}}),
       requireRoundTrip:async()=>({ok:true,sim:{status:'SIMULATED_NOT_FILLED'}}),
       netExitValue:async()=>({usd:30,gas:1,net:29,mark:29,uneconomic:false}),
       stress:{incomplete:true},
@@ -325,8 +325,8 @@ function tmp(){return mkdtempSync(join(tmpdir(),'abc-repair-'));}
 {
   const pool={quote:zeroAddress,quoteDecimals:18,token:zeroAddress};
   const rates={prices:{ethereum:{usd:2000},'global-dollar':{usd:1},tether:{usd:1}}};
-  const buy={amountOut:10n**18n,quoterGasEstimate:1n};
-  const sell={amountOut:1n,quoterGasEstimate:1n};
+  const buy={amountOut:10n**18n,executionFeeWei:10000000000000n,quoterGasEstimate:1n};
+  const sell={amountOut:1n,executionFeeWei:10000000000000n,quoterGasEstimate:1n};
   JSON.parse(JSON.stringify({plan:plannedRoundTripFromQuotes(buy,sell,pool,30,10n**18n,rates,1n,50n)},(_,v)=>typeof v==='bigint'?v.toString():v));
   assert('roundtrip quotes serializable via stringify helper',true);
 }
@@ -394,7 +394,7 @@ function tmp(){return mkdtempSync(join(tmpdir(),'abc-repair-'));}
   } finally {rmSync(dir,{recursive:true,force:true});}
 }
 
-assert('strategy version is v10',STRATEGY_VERSION==='abc-phase1-v10');
+assert('strategy version is v11',STRATEGY_VERSION==='abc-phase1-v11');
 {
   const dir=tmp();
   try {
@@ -524,7 +524,7 @@ assert('strategy version is v10',STRATEGY_VERSION==='abc-phase1-v10');
       poolFor:async()=>fakePool,
       collectBuckets:async()=>({minutes:35}),
       safetyScreen:async()=>({ok:true,reasons:[]}),
-      plannedRoundTrip:async()=>({qty:10n,cash_out:30.5,loss_pct:0.01,buyGas:0.5,sellGas:0.5,amountIn:1n,buy:{amountOut:10n,quoterGasEstimate:1n},sell:{amountOut:1n,quoterGasEstimate:1n}}),
+      plannedRoundTrip:async()=>({qty:10n,cash_out:30.5,loss_pct:0.01,buyGas:0.5,sellGas:0.5,amountIn:1n,buy:{amountOut:10n,executionFeeWei:10000000000000n,quoterGasEstimate:1n},sell:{amountOut:1n,executionFeeWei:10000000000000n,quoterGasEstimate:1n}}),
       requireRoundTrip:async()=>({ok:true,sim:{status:'SIMULATED_NOT_FILLED'}}),
       netExitValue:async()=>({usd:30,gas:1,net:29,mark:29,uneconomic:false}),
       stress:{incomplete:true},
@@ -848,6 +848,28 @@ assert('strategy version is v10',STRATEGY_VERSION==='abc-phase1-v10');
   assert('daily demo quota pauses until next UTC day',logProviderPauseUntil({details:'daily request limit reached - upgrade your account'},now)===Date.UTC(2026,8,9));
   assert('transient throttling has short pause only',logProviderPauseUntil({message:'429 too many requests'},now)===now+30000);
   assert('unrelated source error is not a daily quota',logProviderPauseUntil({message:'invalid filter'},now)===0);
+}
+
+{
+  const rates={prices:{ethereum:{usd:2000}}};
+  assert('route gas has no fixed dollar floor or extra allowance',Math.abs(modeledGasUsd({executionFeeWei:50000000000000n},1n,rates)-0.1)<1e-12);
+  let missing=false;try {modeledGasUsd({quoterGasEstimate:200000n},1n,rates);} catch(e) {missing=e.message==='EXECUTION_GAS_UNKNOWN';}
+  assert('quoter estimate alone cannot masquerade as execution fee',missing);
+  assert('base execution haircut is zero; stress remains explicit',HAIRCUT_BPS===0n);
+  const pool={quote:zeroAddress,quoteDecimals:18,token:zeroAddress};
+  const buy={amountOut:1000n,executionFeeWei:50000000000000n};
+  const sell={amountOut:14500000000000000n,executionFeeWei:100000000000000n};
+  const plan=plannedRoundTripFromQuotes(buy,sell,pool,30,1000n,rates,1n);
+  assert('fees charged once from actual simulated leg costs',Math.abs(plan.cash_out-30.1)<1e-12&&Math.abs(plan.recovered-28.8)<1e-12&&Math.abs(plan.loss-1.3)<1e-12);
+}
+
+{
+  const original=catalogClient.simulateContract;
+  try {
+    catalogClient.simulateContract=async()=>({result:[100n,2n,1n]});
+    const fees=await simulationFees([{to:zeroAddress},{to:zeroAddress}],[{status:'success',gasUsed:21000n},{status:'success',gasUsed:30000n}],{number:1n},10n,1);
+    assert('L1 fee is counted once and approvals belong to their leg',fees.buyWei===210200n&&fees.sellWei===300200n&&fees.buyL1Wei===200n&&fees.sellL1Wei===200n);
+  } finally {catalogClient.simulateContract=original;}
 }
 
 if(fails.length){console.error('FAILED',fails.length,fails.join(','));process.exitCode=1;}

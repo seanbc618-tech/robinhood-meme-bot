@@ -4,11 +4,11 @@ import {resolve} from 'node:path';
 import {formatUnits,parseUnits,getAddress,zeroAddress} from 'viem';
 import {
   ROOT,A,client,erc20,factoryAbi,hookAbi,swapEvent,failure,requireValue,same,save,
-  poolFor,quoteExact,quoteUsd,usdRates,blockContext,holderData,roundTrip,stringify,withRpcDeadline,
+  poolFor,quoteExact,quoteUsd,usdRates,blockContext,holderData,roundTrip,stringify,withRpcDeadline,simulateExit,
 } from './chain.mjs';
 
-export const STRATEGY_VERSION='abc-phase1-v10';
-export const CODE_VERSION='abc-phase1-v10';
+export const STRATEGY_VERSION='abc-phase1-v11';
+export const CODE_VERSION='abc-phase1-v11';
 export const STALE_SEC=120;
 // Historical minute folding may receive a source timestamp a little after the
 // live freshness boundary.  Keep this separate from STALE_SEC: live quotes,
@@ -24,7 +24,7 @@ export const WATCH_MAX_MS=36*3600*1000;
 export const WATCH_WINDOW_MINUTES=120;
 export const LIVE_MAX_LAG=2000n;
 export const LIVE_LOOKBACK=900n;
-export const HAIRCUT_BPS=50n;
+export const HAIRCUT_BPS=0n;
 export const LOG_CHUNK=300n;
 export const MAX_LOG_BLOCKS_PER_POOL=900n;
 export const CATALOG_MAX_BLOCKS=900n;
@@ -79,8 +79,8 @@ export function haircutQty(amount,bps=HAIRCUT_BPS) {
 }
 
 export function modeledGasUsd(q,gasPrice,rates) {
-  const exec=Number(formatUnits((q.quoterGasEstimate+180000n)*gasPrice,18))*rates.prices.ethereum.usd;
-  return Math.max(0.25,exec)+0.25;
+  requireValue(q.executionFeeWei!=null&&BigInt(q.executionFeeWei)>=0n,'EXECUTION_GAS_UNKNOWN');
+  return Number(formatUnits(BigInt(q.executionFeeWei),18))*rates.prices.ethereum.usd;
 }
 
 export function sqrtPriceToUsd(pool,sqrtPriceX96,rates) {
@@ -219,7 +219,7 @@ export function initAccounts(store) {
       equity:1000,unrealized:0,realized:0,positions:[],trades:[],seen:[],
       used_signals:[],signal_state:{},closed_rounds:[],problems:[],reject_counts:{},
       failed_sells:0,exit_incomplete:0,max_drawdown:0,max_drawdown_pct:0,peak_equity:1000,
-      model:'QUOTE_MINUS_50BPS_HAIRCUT_PLUS_GAS_AND_L1',
+      model:'SIMULATED_ROUTE_AND_NODE_GAS_V11',
       capital_note:'Virtual USDT budget marked in USD; not a claim of held USDT',
       version:STRATEGY_VERSION,created_at:now,
     };
@@ -915,20 +915,24 @@ export function plannedRoundTripFromQuotes(buy,sell,pool,principalUsd,qty,rates,
 export async function plannedRoundTrip(pool,principalUsd,block,rates,gasPrice,haircutBps=HAIRCUT_BPS) {
   const px=quoteUsd(pool,rates);
   const amountIn=parseUnits((principalUsd/px).toFixed(Math.min(pool.quoteDecimals,12)),pool.quoteDecimals);
-  const buy=await quoteExact(pool,pool.quote,amountIn,block.number);
-  const qty=haircutQty(buy.amountOut,haircutBps);
-  const sell=await quoteExact(pool,pool.token,qty,block.number);
-  return {...plannedRoundTripFromQuotes(buy,sell,pool,principalUsd,qty,rates,gasPrice,haircutBps),amountIn};
+  if(pool.quote!==zeroAddress&&!process.env.ROBINHOOD_WALLET) throw new Error('USDG_SIMULATION_REQUIRES_FUNDED_ACCOUNT');
+  const simulation=await roundTrip(pool,amountIn,block,pool.quote===zeroAddress?undefined:process.env.ROBINHOOD_WALLET,{withFees:true,gasPrice});
+  const buy={...simulation.buy_quote,amountOut:simulation.token_received,executionFeeWei:simulation.fees.buyWei};
+  const sell={...simulation.sell_quote,amountOut:simulation.quote_returned,executionFeeWei:simulation.fees.sellWei};
+  const qty=simulation.token_received;
+  requireValue(haircutBps===0n,'BASE_SIMULATION_REQUIRES_ZERO_HAIRCUT');
+  const plan=plannedRoundTripFromQuotes(buy,sell,pool,principalUsd,qty,rates,gasPrice,0n);
+  return {...plan,amountIn,simulation,fee_evidence:simulation.fees,
+    l1GasUsd:Number(formatUnits(simulation.fees.buyL1Wei+simulation.fees.sellL1Wei,18))*rates.prices.ethereum.usd};
 }
 
-export async function netExitValue(pool,qty,block,rates,gasPrice,haircutBps=HAIRCUT_BPS) {
+export async function netExitValue(pool,qty,block,rates,gasPrice,haircutBps=HAIRCUT_BPS,candidates=[]) {
   qty=BigInt(qty);
   if(qty<=0n) return {net:0,mark:0,usd:0,gas:0,quote:null,uneconomic:false};
-  const q=await quoteExact(pool,pool.token,qty,block.number);
-  const px=quoteUsd(pool,rates);
-  const usd=Number(formatUnits(haircutQty(q.amountOut,haircutBps),pool.quoteDecimals))*px;
-  const gas=modeledGasUsd(q,gasPrice,rates);
-  const net=usd-gas;
+  if(!candidates.length) candidates=(await holderData(pool,block.number)).summary.top10.map(h=>h.address);
+  const q=await simulateExit(pool,qty,block,gasPrice,candidates);
+  const usd=Number(formatUnits(haircutQty(q.amountOut,haircutBps),pool.quoteDecimals))*quoteUsd(pool,rates);
+  const gas=modeledGasUsd(q,gasPrice,rates),net=usd-gas;
   return {usd,gas,net,mark:Math.max(0,net),quote:q,uneconomic:net<0};
 }
 

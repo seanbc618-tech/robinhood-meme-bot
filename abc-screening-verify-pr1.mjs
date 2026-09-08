@@ -231,8 +231,8 @@ export function runPr1Regressions(assert) {
   const pool={quote:zeroAddress,quoteDecimals:18};
   const rates={prices:{ethereum:{usd:3000},'global-dollar':{usd:1}}};
   const gasPrice=1_000_000_000n; // 1 gwei
-  const buy={amountOut:10n**18n,quoterGasEstimate:100000n};
-  const sell={amountOut:10n**16n,quoterGasEstimate:120000n}; // 0.01 ETH pre-haircut
+  const buy={amountOut:10n**18n,executionFeeWei:10000000000000n,quoterGasEstimate:100000n};
+  const sell={amountOut:10n**16n,executionFeeWei:10000000000000n,quoterGasEstimate:120000n}; // 0.01 ETH pre-haircut
   const planRt=plannedRoundTripFromQuotes(buy,sell,pool,30,buy.amountOut,rates,gasPrice,50n);
   assert('plannedRoundTripFromQuotes haircut_bps nonzero',planRt.haircut_bps===50,planRt);
   const brRt=quoteLossBreakdown(planRt);

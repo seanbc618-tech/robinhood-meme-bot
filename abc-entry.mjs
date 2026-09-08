@@ -18,7 +18,7 @@ export async function markAndExit(store,account,block,rates,gasPrice,now,io={}) 
   for(const p of account.positions) {
     try {
       const pool=await getPool(p.token,block.number);
-      const marked=await quoteNet(pool,p.qty,block,rates,gasPrice);
+      const marked=await quoteNet(pool,p.qty,block,rates,gasPrice,HAIRCUT_BPS,p.exit_candidates||[]);
       p.mark=marked.mark;p.mark_raw=marked.net;p.mark_block=String(block.number);p.exit_incomplete=false;
       const multiple=pnlMultiple(p,marked.mark);
       if(multiple!=null&&multiple>(p.peak_multiple||0)) p.peak_multiple=multiple;
@@ -44,7 +44,7 @@ export async function markAndExit(store,account,block,rates,gasPrice,now,io={}) 
         let lo=1n,hi=qty;
         for(let i=0;i<14&&lo<hi;i++) {
           const mid=(lo+hi)/2n;
-          const q=await quoteNet(pool,mid,block,rates,gasPrice);
+          const q=await quoteNet(pool,mid,block,rates,gasPrice,HAIRCUT_BPS,p.exit_candidates||[]);
           if(q.net>=target) hi=mid;else lo=mid+1n;
         }
         qty=hi;
@@ -53,14 +53,14 @@ export async function markAndExit(store,account,block,rates,gasPrice,now,io={}) 
       const commitAt=clock();
       const stale=assertTradeFresh(block,rates,commitAt);
       if(stale) {p.exit_incomplete=true;count(account,stale);writeAccount(store,account);continue;}
-      const fill=await quoteNet(pool,qty,block,rates,gasPrice);
+      const fill=await quoteNet(pool,qty,block,rates,gasPrice,HAIRCUT_BPS,p.exit_candidates||[]);
       if(fill.uneconomic||fill.net<0) {
         p.exit_incomplete=true;count(account,'UNECONOMIC_EXIT');writeAccount(store,account);continue;
       }
       if(dec.reason==='recover'&&fill.net<p.cost-p.proceeds) throw new Error('RECOVERY_QUOTE_BELOW_TARGET');
       applySell(account,p,qty,fill.net,dec.reason,block.number,{quote_block:block.number,decision_ts:now,fill_ts:commitAt});
       if(account.positions.includes(p)&&BigInt(p.qty)>0n) {
-        const rem=await quoteNet(pool,p.qty,block,rates,gasPrice);
+        const rem=await quoteNet(pool,p.qty,block,rates,gasPrice,HAIRCUT_BPS,p.exit_candidates||[]);
         p.mark=rem.mark;p.mark_raw=rem.net;
       }
       recomputeEquity(account);
@@ -107,15 +107,15 @@ export async function tryEnter(store,account,token,signal,pool,block,rates,gasPr
   if(plan.cash_out>account.spend_limit) {count(account,'CASH_OUT_OVER_CAP');writeAccount(store,account);return {skipped:'CASH_OUT_OVER_CAP',safety:screen,plan};}
   if(account.cash-plan.cash_out<account.reserve) {count(account,'RESERVE_FLOOR');writeAccount(store,account);return {skipped:'RESERVE_FLOOR',safety:screen,plan};}
   if(!(plan.loss_pct<=0.05)) {count(account,'ROUND_TRIP_COST_OVER_5_PERCENT');writeAccount(store,account);return {skipped:'ROUND_TRIP_COST_OVER_5_PERCENT',safety:{...screen,ok:false,checks:(screen.checks||[]).concat([{name:'round_trip_loss_pct',value:plan.loss_pct,threshold:0.05,status:'FAIL',reason:'ROUND_TRIP_COST_OVER_5_PERCENT',source:'plannedRoundTrip.loss_pct'}])},plan};}
-  const sim=await (io.requireRoundTrip||requireRoundTrip)(entryPool,plan.amountIn,block);
+  const sim=plan.simulation?{ok:true,sim:plan.simulation}:await (io.requireRoundTrip||requireRoundTrip)(entryPool,plan.amountIn,block);
   if(!sim.ok) {count(account,sim.reason==='USDG_SIMULATION_REQUIRES_FUNDED_ACCOUNT'?sim.reason:'ROUND_TRIP_SIM_FAILED');writeAccount(store,account);return {skipped:sim.reason,safety:screen,plan};}
   let stress={};
   try {
     if(io.stress) stress=io.stress;
-    else for(const bps of [150n,300n]) {
+    else for(const bps of [50n,150n,300n]) {
       const qty=haircutQty(plan.buy.amountOut,bps);
       const sell=await quoteExact(entryPool,entryPool.token,qty,block.number);
-      stress['bps_'+String(bps)]=plannedRoundTripFromQuotes(plan.buy,sell,entryPool,principal,qty,rates,gasPrice,bps);
+      stress['bps_'+String(bps)]=plannedRoundTripFromQuotes(plan.buy,{...sell,executionFeeWei:plan.sell.executionFeeWei},entryPool,principal,qty,rates,gasPrice,bps);
     }
   } catch {stress.incomplete=true;}
   const commitAt=clock();
@@ -123,12 +123,12 @@ export async function tryEnter(store,account,token,signal,pool,block,rates,gasPr
   if(stale) {count(account,stale);writeAccount(store,account);return {skipped:stale,safety:screen,plan};}
   const ok=applyBuy(account,{token,qty:plan.qty,cost:plan.cash_out,block:block.number,signal_ts:signal.minute,
     signal_block:signal.block,decision_ts:now,quote_block:block.number,fill_ts:commitAt,reason:'entry',
-    plan:{loss_pct:plan.loss_pct,buy_gas:plan.buyGas,sell_gas:plan.sellGas,haircut_bps:50,stress,simulation:sim.sim?.status},
+    plan:{loss_pct:plan.loss_pct,buy_gas:plan.buyGas,sell_gas:plan.sellGas,haircut_bps:Number(HAIRCUT_BPS),fee_evidence:plan.fee_evidence,exit_candidates:screen.holders?.top10?.map(h=>h.address)||[],stress,simulation:sim.sim?.status},
     version:STRATEGY_VERSION});
   if(!ok) {count(account,'APPLY_BUY_REJECTED');writeAccount(store,account);return {skipped:'APPLY_BUY_REJECTED',safety:screen,plan};}
   account.used_signals.push(sid);
   try {
-    const marked=await quoteNet(entryPool,plan.qty,block,rates,gasPrice);
+    const marked=await quoteNet(entryPool,plan.qty,block,rates,gasPrice,HAIRCUT_BPS,screen.holders?.top10?.map(h=>h.address)||[]);
     const pos=account.positions.find(p=>p.token===token);
     if(pos) {pos.mark=marked.mark;pos.mark_raw=marked.net;}
   } catch {const pos=account.positions.find(p=>p.token===token);if(pos) pos.mark=null;}

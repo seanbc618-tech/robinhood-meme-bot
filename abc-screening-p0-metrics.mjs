@@ -147,7 +147,7 @@ export function quoteLossBreakdown(plan) {
     },
     buy_gas_usd:{status:Number.isFinite(plan.buyGas)?'OBSERVED':'UNKNOWN',value:plan.buyGas??null},
     sell_gas_usd:{status:Number.isFinite(plan.sellGas)?'OBSERVED':'UNKNOWN',value:plan.sellGas??null},
-    l1_allowance:{status:'UNKNOWN',value:null,note:'L1 allowance not isolated in paper plan - PLACEHOLDER/unavailable'},
+    l1_allowance:{status:Number.isFinite(plan.l1GasUsd)?'OBSERVED':'UNKNOWN',value:plan.l1GasUsd??null,note:Number.isFinite(plan.l1GasUsd)?'NodeInterface data fee included once in buy/sell gas; not additive':'L1 component unavailable'},
     total_round_trip_loss_usd:{status:Number.isFinite(plan.loss)?'OBSERVED':'UNKNOWN',value:plan.loss??null},
     total_round_trip_loss_pct:{status:Number.isFinite(plan.loss_pct)?'OBSERVED':'UNKNOWN',value:plan.loss_pct??null},
   };

@@ -300,6 +300,11 @@ export async function worker(hours,foreground=false) {
   try {
     initAccounts(store);
     migrateCSize(store);
+    for(const strategy of ['A','B','C']) {
+      const account=readAccount(store,strategy);
+      account.model='SIMULATED_ROUTE_AND_NODE_GAS_V11';
+      writeAccount(store,account);
+    }
     let run=readRun(store);
     if(run&&run.code_version!==CODE_VERSION) {
       if(!run.code_version||run.code_version==='abc-phase1-v1') {
@@ -307,7 +312,7 @@ export async function worker(hours,foreground=false) {
         run.v1_buckets_invalidated=true;
       }
       isolateNonContemporaneousFx(store);
-      extendActiveWatchBounds(store);
+      if(!['abc-phase1-v10','abc-phase1-v11'].includes(run.code_version)) extendActiveWatchBounds(store);
       run.code_version=CODE_VERSION;
       writeRun(store,run);
     }

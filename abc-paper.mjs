@@ -57,7 +57,7 @@ export function applyBuy(s,{token,qty,cost,block,signal_ts,signal_block,decision
   s.positions.push({token,qty:String(qty),initialQty:String(qty),cost,remainingCost:cost,proceeds:0,
     half:false,opened:fill_ts||Date.now(),open_block:String(block),signal_ts,signal_block:signal_block==null?null:String(signal_block),
     decision_ts,quote_block:String(quote_block||block),fill_ts,peak_multiple:1,trail_armed:false,
-    mark:null,exit_incomplete:false,strategy_version:version||STRATEGY_VERSION});
+    mark:null,exit_incomplete:false,exit_candidates:plan?.exit_candidates||[],strategy_version:version||STRATEGY_VERSION});
   s.trades.push({id,side:'buy',token,qty:String(qty),net:cost,block:String(block),at:fill_ts||Date.now(),
     reason:reason||'entry',signal_ts,signal_block:signal_block==null?null:String(signal_block),
     decision_ts,quote_block:String(quote_block||block),fill_ts,plan,paper:true,abc:true,live:false,version:version||STRATEGY_VERSION});
