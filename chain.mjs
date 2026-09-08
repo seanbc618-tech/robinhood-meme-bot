@@ -91,6 +91,8 @@ const ALCHEMY_LOG_RETRIES=2;
 // A public 429 or timeout is transient; the old five-minute blackout forced whole
 // cycles onto the 10-block Alchemy path, which cannot keep up with the chain.
 const PUBLIC_LOG_PAUSE_MS=30000;
+const PUBLIC_LOG_THROTTLE_RETRIES=2;
+const PUBLIC_LOG_THROTTLE_BACKOFF_MS=800;
 let publicNextAt=0;
 let publicDisabledUntil=0;
 function extraLogConfig() {
@@ -119,23 +121,32 @@ function safeErrorText(error) {
   return errorText(error).replace(/https?:\/\/[^\s]+/g,'[RPC URL redacted]')
     .replace(/(?:ak_|alch_)[a-zA-Z0-9_-]+/g,'[key redacted]').slice(0,180);
 }
+function throttleError(error) { return /429|too many requests|rate.?limit/i.test(errorText(error)); }
 function quotaError(error) { return /402|daily.?response.?quota|daily request limit reached|quota (?:exceeded|exhausted)/i.test(errorText(error)); }
 function nextUtcReset() {
   const d=new Date(); d.setUTCHours(24,0,0,0); return d.getTime();
 }
 export function logProviderPauseUntil(error,now=Date.now()) {
   if(quotaError(error)) {const d=new Date(now);d.setUTCHours(24,0,0,0);return d.getTime();}
-  return /429|too many requests|rate.?limit/i.test(errorText(error))?now+30000:0;
+  return throttleError(error)?now+30000:0;
 }
 function noteLogFailure(provider,error,args) {
   const p=args.params?.[0]||{};
   logRpcHealth.last_failure={provider,method:args.method,from:p.fromBlock,to:p.toBlock,address:p.address,at:Date.now(),code:error.code??error.cause?.code??null,error:safeErrorText(error)};
 }
 async function publicLogRequest(args) {
-  const wait=Math.max(0,publicNextAt-Date.now());
-  if(wait>0) await new Promise(resolve=>setTimeout(resolve,wait));
-  publicNextAt=Date.now()+PUBLIC_LOG_MIN_INTERVAL_MS;
-  return logTransport.request(args);
+  for(let attempt=0;;attempt++) {
+    const wait=Math.max(0,publicNextAt-Date.now());
+    if(wait>0) await new Promise(resolve=>setTimeout(resolve,wait));
+    rpcScope.getStore()?.throwIfAborted();
+    publicNextAt=Date.now()+PUBLIC_LOG_MIN_INTERVAL_MS;
+    try { return await logTransport.request(args); }
+    catch(error) {
+      // Throttling is cheaper to wait out than the 10-block Alchemy fallback.
+      if(attempt>=PUBLIC_LOG_THROTTLE_RETRIES||!throttleError(error)) throw error;
+      publicNextAt=Date.now()+PUBLIC_LOG_THROTTLE_BACKOFF_MS*(attempt+1);
+    }
+  }
 }
 async function alchemyChunkRequest(args) {
   let last;
