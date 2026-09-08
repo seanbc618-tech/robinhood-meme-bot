@@ -543,6 +543,8 @@ export async function syncCatalog(store,block,io={}) {
       registered=await rpcRetry((ms)=>rpcTimeout(()=>client.getLogs({address:A.hook,event:hookAbi.find(a=>a.name==='PoolRegistered'),fromBlock:from,toBlock:to,strict:true}),ms,`eth_getLogs PoolRegistered ${from}-${to}`,io),io);
       graduated=await rpcRetry((ms)=>rpcTimeout(()=>client.getLogs({address:A.factory,event:factoryAbi.find(a=>a.name==='PoolGraduated'),fromBlock:from,toBlock:to,strict:true}),ms,`eth_getLogs PoolGraduated ${from}-${to}`,io),io);
     } catch(error) {
+      // Spending the catalog slice is expected partial progress, not an outage.
+      if(io.deadline&&Date.now()>=io.deadline&&/RPC_TIMEOUT|RPC_DEADLINE/.test(error.message||'')) break;
       store.bump(classifyError(error));
       throw error;
     }
@@ -580,7 +582,7 @@ export async function syncCatalog(store,block,io={}) {
     run[cursorKey]=String(to);
     writeRun(store,run);
   }
-  return {added,from:String(start),to:run[cursorKey],head:String(block.number),live:!!io.liveCatalog};
+  return {added,from:String(start),to:run[cursorKey],head:String(block.number),live:!!io.liveCatalog,budget_exhausted:!!io.deadline&&Date.now()>=io.deadline};
 }
 
 export function graduationTs(row) {

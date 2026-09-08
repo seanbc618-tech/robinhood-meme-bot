@@ -18,7 +18,8 @@ import {
   evaluateA,exitDecision,pnlMultiple,nextTickDeadline,sleepUntil,
 } from './abc.mjs';
 
-import {ensureRoleWatchSlots} from './abc-collect.mjs';
+import {ensureRoleWatchSlots,syncCatalog} from './abc-collect.mjs';
+import {client as catalogClient} from './chain.mjs';
 import {evaluators} from './abc-strategy.mjs';
 const fails=[];
 function assert(name,ok,detail){if(ok) console.log('PASS',name); else {console.log('FAIL',name,detail||'');fails.push(name);}}
@@ -805,6 +806,17 @@ assert('strategy version is v10',STRATEGY_VERSION==='abc-phase1-v10');
     server.closeAllConnections();await new Promise(r=>server.close(r));
     for(const k of keys) {if(before[k]===undefined)delete process.env[k];else process.env[k]=before[k];}
   }
+}
+
+{
+  const dir=tmp(),getLogs=catalogClient.getLogs;
+  try {
+    const st=openAbc(dir);writeRun(st,{catalog_cursor:'1'});
+    catalogClient.getLogs=async()=>{await new Promise(r=>setTimeout(r,15));throw new Error('RPC_TIMEOUT catalog');};
+    const result=await syncCatalog(st,{number:100n},{deadline:Date.now()+5});
+    assert('catalog time slice preserves cursor and reports normal budget exhaustion',result.to==='1'&&result.budget_exhausted&&readRun(st).catalog_cursor==='1');
+    st.close();
+  } finally {catalogClient.getLogs=getLogs;rmSync(dir,{recursive:true,force:true});}
 }
 
 if(fails.length){console.error('FAILED',fails.length,fails.join(','));process.exitCode=1;}

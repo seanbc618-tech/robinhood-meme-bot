@@ -110,6 +110,7 @@ export async function cycle(store,now=Date.now(),io={}) {
   ensureScreeningSchema(store);
   const run=readRun(store);
   run.status='CYCLE';run.last_started_at=now;run.code_version=CODE_VERSION;
+  run.last_pool_error=null; // Current-cycle status; historical errors remain in recorded diagnostics.
   writeRun(store,run);
   const block=await (io.blockContext||blockContext)();
   const rates=await (io.usdRates||usdRates)();
