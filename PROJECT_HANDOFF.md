@@ -49,6 +49,14 @@
 - 新增回归用例（`abc-repair-verify.mjs`）：tick 间隔小于整轮、无持仓时零 RPC、有持仓时被检查、击穿止损能在两轮之间成交、成交记为 `paper=true/live=false`。本地与 VPS 三组检查全过。
 - 部署后：`current=releases/aae5c26`、PID `1131395`、`rounds=4649`、`lag=0`、`analyzed=4`、`cycle≈29.7s`。A/B cash=1000/trades=0，C 保持 `cash=equity=989.3032319159197`、`trades=2`，实验起止时间未变。`exit_ticks` 当前为空属正常——此刻无持仓，tick 不计数。
 
+### 2026-09-09：VPS 磁盘清理与 `releases/392da39` 的作用（重要，勿删）
+
+- `releases/` 从 4.8G 降到 413M（释放 3.61 GiB，`/` 使用率 53% → 50%）。删除了 18 个旧 release：046418e、09565dd、110a361、11c1211、17aaf30、53e448a、77bb73f、7a9ca4e、8b12593、a763915、b1d2cd1、c254302、dca180d、de36de4、ea84fb1、eb74f20、efec104、fe765fa。
+- 保留 4 个：`aae5c26`（current，运行中）、`0c2b9ed`、`f575cec`（回滚点），以及 **`392da39`**。
+- **`releases/392da39` 不是可有可无的旧版本：它持有真实的 `node_modules` 目录，`aae5c26`/`0c2b9ed`/`f575cec` 以及 `staging/v11-cost-20260908` 的 `node_modules` 都是指向它的符号链接。删掉它会让正在运行的 worker 和隔离目录一起失效。** 若要彻底清掉它，必须先把 `node_modules` 迁到 `<VPS_ROOT>/shared/` 并重指所有链接，不要在 worker 运行时做。
+- 新 release 沿用现有做法：`cp -a` 上一个 release 后只替换改动文件，`node_modules` 符号链接自然继承指向 392da39，不需要重新 `npm ci`。以后每次发布后顺手清掉过期 release，别再攒到 29 个。
+- 清理脚本 `staging/prune-releases.py` 保留：它会先断言 current 与 worker cwd 一致、且没有任何保留目录的符号链接指向待删目录，再删除并复核 `node_modules` 仍可解析。删除后已核对 worker PID 1131395 存活、rounds 继续推进、lag=0、三账户与实验起止时间不变。
+
 ### 新 session 下一步顺序
 
 1. 只读核实 current、PID cwd、run、accounts；重点查 `screening_evals` 是否出现 `paper_filled=1`，以及 `ROUND_TRIP_COST_OVER_GATE` 与 `USD_SOURCE_STALE` 的新计数。
