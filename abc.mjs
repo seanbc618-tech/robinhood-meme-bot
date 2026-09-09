@@ -16,7 +16,7 @@ export {
 export {evaluateA,evaluateB,evaluateC,signalId,evaluators} from './abc-strategy.mjs';
 export {markAndExit,tryEnter} from './abc-entry.mjs';
 export {
-  acquireLock,releaseLock,nextTickDeadline,sleepUntil,cycle,worker,
+  acquireLock,releaseLock,nextTickDeadline,sleepUntil,cycle,worker,exitOnlyTick,EXIT_TICK_MS,
   printStatus,printReport,
 } from './abc-runtime.mjs';
 

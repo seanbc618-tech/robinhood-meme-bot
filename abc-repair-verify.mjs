@@ -10,12 +10,12 @@ import {
   collectBuckets,netExitValue,HAIRCUT_BPS,STRATEGY_VERSION,loadBuckets,
   foldStoredEvents,fxContemporaneous,fxForMinute,skipBacklogForLive,saveFxSnap,ensureWatchSlots,logBlocksNeeded,
   HISTORICAL_FX_STALE_SEC,
-  migrateCSize,
+  migrateCSize,CYCLE_TARGET_MS,
   modeledGasUsd,watchSlotDecision,WATCH_MAX_MS,WATCH_POST_MATURITY_MS,rpcRetry,RPC_CALL_TIMEOUT_MS,
 } from './abc-collect.mjs';
 import {
   cycle,tryEnter,markAndExit,recomputeEquity,applyBuy,applySell,evaluateB,evaluateC,
-  evaluateA,exitDecision,pnlMultiple,nextTickDeadline,sleepUntil,
+  evaluateA,exitDecision,pnlMultiple,nextTickDeadline,sleepUntil,exitOnlyTick,EXIT_TICK_MS,
 } from './abc.mjs';
 
 import {ensureRoleWatchSlots,syncCatalog} from './abc-collect.mjs';
@@ -870,6 +870,42 @@ assert('strategy version is v11',STRATEGY_VERSION==='abc-phase1-v11');
     const fees=await simulationFees([{to:zeroAddress},{to:zeroAddress}],[{status:'success',gasUsed:21000n},{status:'success',gasUsed:30000n}],{number:1n},10n,1);
     assert('L1 fee is counted once and approvals belong to their leg',fees.buyWei===210200n&&fees.sellWei===300200n&&fees.buyL1Wei===200n&&fees.sellL1Wei===200n);
   } finally {catalogClient.simulateContract=original;}
+}
+
+
+{
+  // Between-cycle exit checks: no positions must cost nothing, and a breached stop must fill
+  // without waiting for the next full cycle.
+  const dir=tmp();
+  try {
+    const store=openAbc(dir);
+    initAccounts(store);
+    assert('exit tick is shorter than a full cycle',EXIT_TICK_MS<CYCLE_TARGET_MS,{EXIT_TICK_MS,CYCLE_TARGET_MS});
+    let chainCalls=0;
+    const io={
+      blockContext:async()=>{chainCalls++;return {number:2n,timestamp:BigInt(Math.floor(Date.now()/1000))};},
+      usdRates:async()=>{chainCalls++;const t=Math.floor(Date.now()/1000);
+        return {observed_at:t,prices:{ethereum:{usd:1,last_updated_at:t},tether:{usd:1,last_updated_at:t},'global-dollar':{usd:1,last_updated_at:t}}};},
+      gasPrice:1n,
+      poolFor:async()=>({token:'0x1'}),
+      // A stop-level quote: 1000 units mark at 21 against a cost of 30.
+      netExitValue:async(pool,qty)=>({usd:22,gas:1,net:21,mark:21,uneconomic:false}),
+    };
+    const idle=await exitOnlyTick(store,Date.now(),io);
+    assert('exit tick skips accounts with no positions',idle.checked===0&&chainCalls===0,{idle,chainCalls});
+
+    const a=readAccount(store,'C');
+    applyBuy(a,{token:'0x1',qty:1000n,cost:30,block:1,signal_ts:1,decision_ts:1,quote_block:1,fill_ts:1});
+    a.positions[0].opened=Date.now()-60000;
+    writeAccount(store,a);
+    const busy=await exitOnlyTick(store,Date.now(),io);
+    assert('exit tick checks the holding account',busy.checked===1,busy);
+    const disk=readAccount(store,'C');
+    assert('breached stop fills on the between-cycle tick',disk.positions.length===0&&disk.trades.some(t=>t.side==='sell'),
+      {positions:disk.positions.length,trades:disk.trades.map(t=>t.side)});
+    assert('stop fill is recorded as a paper sell, not a live trade',disk.trades.filter(t=>t.side==='sell').every(t=>t.paper===true&&t.live===false),disk.trades);
+    store.close();
+  } finally {rmSync(dir,{recursive:true,force:true});}
 }
 
 if(fails.length){console.error('FAILED',fails.length,fails.join(','));process.exitCode=1;}

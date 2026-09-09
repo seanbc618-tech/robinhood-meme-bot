@@ -100,6 +100,21 @@ export async function sleepUntil(deadline,shouldStop,stepMs=50) {
   while(Date.now()<deadline&&!(shouldStop&&shouldStop())) await new Promise(r=>setTimeout(r,stepMs));
 }
 
+export const EXIT_TICK_MS=15000;
+// Held positions are only marked once per full cycle, so a stop can sit unfilled for a whole
+// minute while the token keeps falling. Re-check them between cycles: this quotes only what is
+// held and touches neither the collection budget nor the log providers.
+export async function exitOnlyTick(store,now=Date.now(),io={}) {
+  const accounts=['A','B','C'].map(s=>readAccount(store,s)).filter(a=>a.positions.length>0);
+  if(!accounts.length) return {checked:0};
+  const block=await (io.blockContext||blockContext)();
+  const rates=await (io.usdRates||usdRates)();
+  assertFreshness(block,rates,now/1000);
+  const gasPrice=io.gasPrice!=null?io.gasPrice:await client.getGasPrice();
+  for(const account of accounts) await markAndExit(store,account,block,rates,gasPrice,now,io);
+  return {checked:accounts.length};
+}
+
 function isTransientEntry(result) {
   const reasons=[result.skipped,...(result.safety?.reasons||[])].filter(Boolean).join(' ');
   // Staleness is a timing artifact of a source that refreshes every ~2 minutes, not a verdict
@@ -376,7 +391,24 @@ export async function worker(hours,foreground=false) {
       }
       await notifyHourlyHoldings(store,run);
       const next=Math.min(nextTickDeadline(tickStart),run.ends_at);
-      await sleepUntil(next,()=>stopping||existsSync(resolve(dir,'stop.json')),200);
+      const shouldStop=()=>stopping||existsSync(resolve(dir,'stop.json'));
+      while(Date.now()<next&&!shouldStop()) {
+        await sleepUntil(Math.min(Date.now()+EXIT_TICK_MS,next),shouldStop,200);
+        if(shouldStop()||Date.now()>=next) break;
+        try {
+          const tick=await exitOnlyTick(store,Date.now());
+          if(tick.checked) {
+            run=readRun(store);
+            run.exit_ticks=(run.exit_ticks||0)+1;run.last_exit_tick_at=Date.now();
+            writeRun(store,run);
+          }
+        } catch(error) {
+          // A failed between-cycle check is diagnostic only; the next full cycle still marks.
+          run=readRun(store);
+          run.last_exit_tick_error={error:failure(error),kind:classifyError(error),at:Date.now()};
+          writeRun(store,run);
+        }
+      }
     }
     run=readRun(store);
     const accs=['A','B','C'].map(s=>readAccount(store,s));
