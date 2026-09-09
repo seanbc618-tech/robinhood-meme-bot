@@ -1,7 +1,7 @@
 import {failure} from './chain.mjs';
 import {
   readAccount,writeAccount,plannedRoundTrip,plannedRoundTripFromQuotes,netExitValue,
-  requireRoundTrip,haircutQty,HAIRCUT_BPS,STRATEGY_VERSION,
+  requireRoundTrip,haircutQty,HAIRCUT_BPS,STRATEGY_VERSION,ROUND_TRIP_LOSS_MAX,
   classifyError,quoteExact,assertTradeFresh,poolFor,
 } from './abc-collect.mjs';
 import {
@@ -106,7 +106,7 @@ export async function tryEnter(store,account,token,signal,pool,block,rates,gasPr
   catch(error) {count(account,classifyError(error));writeAccount(store,account);return {skipped:failure(error),safety:{...screen,plan:null,checks:screen.checks||null}};}
   if(plan.cash_out>account.spend_limit) {count(account,'CASH_OUT_OVER_CAP');writeAccount(store,account);return {skipped:'CASH_OUT_OVER_CAP',safety:screen,plan};}
   if(account.cash-plan.cash_out<account.reserve) {count(account,'RESERVE_FLOOR');writeAccount(store,account);return {skipped:'RESERVE_FLOOR',safety:screen,plan};}
-  if(!(plan.loss_pct<=0.05)) {count(account,'ROUND_TRIP_COST_OVER_5_PERCENT');writeAccount(store,account);return {skipped:'ROUND_TRIP_COST_OVER_5_PERCENT',safety:{...screen,ok:false,checks:(screen.checks||[]).concat([{name:'round_trip_loss_pct',value:plan.loss_pct,threshold:0.05,status:'FAIL',reason:'ROUND_TRIP_COST_OVER_5_PERCENT',source:'plannedRoundTrip.loss_pct'}])},plan};}
+  if(!(plan.loss_pct<=ROUND_TRIP_LOSS_MAX)) {count(account,'ROUND_TRIP_COST_OVER_GATE');writeAccount(store,account);return {skipped:'ROUND_TRIP_COST_OVER_GATE',safety:{...screen,ok:false,checks:(screen.checks||[]).concat([{name:'round_trip_loss_pct',value:plan.loss_pct,threshold:ROUND_TRIP_LOSS_MAX,status:'FAIL',reason:'ROUND_TRIP_COST_OVER_GATE',source:'plannedRoundTrip.loss_pct'}])},plan};}
   const sim=plan.simulation?{ok:true,sim:plan.simulation}:await (io.requireRoundTrip||requireRoundTrip)(entryPool,plan.amountIn,block);
   if(!sim.ok) {count(account,sim.reason==='USDG_SIMULATION_REQUIRES_FUNDED_ACCOUNT'?sim.reason:'ROUND_TRIP_SIM_FAILED');writeAccount(store,account);return {skipped:sim.reason,safety:screen,plan};}
   let stress={};

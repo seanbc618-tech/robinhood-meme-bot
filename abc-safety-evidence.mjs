@@ -1,6 +1,6 @@
 import {zeroAddress} from 'viem';
 import {A,failure,holderData} from './chain.mjs';
-import {classifyError} from './abc-collect.mjs';
+import {classifyError,ROUND_TRIP_LOSS_MAX} from './abc-collect.mjs';
 import {dualTop10Concentration} from './abc-screening-risk.mjs';
 
 export async function safetyScreen(store,pool,block,rates) {
@@ -108,7 +108,7 @@ export function buildSafetyEvidence(pool,holdersSummary,holdersError) {
           note:dual.top10_ex_infra_total_supply_bps.note,gate_unchanged:true});
     }
   }
-  push('round_trip_loss_pct',null,0.05,'UNKNOWN','ROUND_TRIP_DEFERRED_UNTIL_ENTRY','tryEnter.plannedRoundTrip',
+  push('round_trip_loss_pct',null,ROUND_TRIP_LOSS_MAX,'UNKNOWN','ROUND_TRIP_DEFERRED_UNTIL_ENTRY','tryEnter.plannedRoundTrip',
     {note:'Heavy holderData/sim only on real entry signal path; not run during collect'});
   return checks;
 }

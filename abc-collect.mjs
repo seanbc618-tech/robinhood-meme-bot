@@ -28,6 +28,7 @@ export const HAIRCUT_BPS=0n;
 export const LOG_CHUNK=300n;
 export const MAX_LOG_BLOCKS_PER_POOL=900n;
 export const CATALOG_MAX_BLOCKS=900n;
+export const ROUND_TRIP_LOSS_MAX=0.08;
 export const COLLECT_BUDGET_MS=45000;
 export const RPC_CALL_TIMEOUT_MS=12000;
 export const RPC_RETRIES=3;

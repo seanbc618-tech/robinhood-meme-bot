@@ -2,7 +2,7 @@ import {mkdtempSync,rmSync,existsSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {zeroAddress} from 'viem';
-import {openAbc,initAccounts,readAccount,writeAccount,quoteFresh,plannedRoundTripFromQuotes} from './abc-collect.mjs';
+import {openAbc,initAccounts,readAccount,writeAccount,quoteFresh,plannedRoundTripFromQuotes,ROUND_TRIP_LOSS_MAX} from './abc-collect.mjs';
 import {
   evaluateA,evaluateB,evaluateC,applyBuy,applySell,exitDecision,sellQtyFor,
   pnlMultiple,applyDayBaseline,canEnter,acquireLock,releaseLock,signalId,
@@ -234,7 +234,7 @@ function freshAccount(strategy='A',principal=30,spend=35) {
   const buy={amountOut:10n**18n,executionFeeWei:10000000000000n,quoterGasEstimate:1n};
   const sellCheap={amountOut:10n**15n,executionFeeWei:10000000000000n,quoterGasEstimate:1n};
   const plan=plannedRoundTripFromQuotes(buy,sellCheap,pool,30,10n**18n,rates,gasPrice,50n);
-  assert('fee threshold rejects expensive round trip',plan.loss_pct>0.05,plan);
+  assert('fee threshold rejects expensive round trip',plan.loss_pct>ROUND_TRIP_LOSS_MAX,plan);
   const sellOk={amountOut:parseUnitsSafe('0.0149'),executionFeeWei:10000000000000n,quoterGasEstimate:1n};
 }
 

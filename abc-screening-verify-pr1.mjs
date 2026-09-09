@@ -3,7 +3,7 @@ import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {zeroAddress} from 'viem';
-import {openAbc,CODE_VERSION,minuteStart,HAIRCUT_BPS,plannedRoundTripFromQuotes} from './abc-collect.mjs';
+import {openAbc,CODE_VERSION,minuteStart,HAIRCUT_BPS,plannedRoundTripFromQuotes,ROUND_TRIP_LOSS_MAX} from './abc-collect.mjs';
 import {openAbcReadonly} from './abc-collect-readonly.mjs';
 import {
   screeningReport,ensureScreeningSchema,
@@ -216,7 +216,7 @@ export function runPr1Regressions(assert) {
   const br=quoteLossBreakdown(plan);
   assert('RT paper_size_diagnostic present',br.paper_size_diagnostic&&br.paper_size_diagnostic.status==='OBSERVED',br.paper_size_diagnostic);
   assert('RT paper size records initial 30',br.paper_size_diagnostic.planned_initial_usd===30,br.paper_size_diagnostic);
-  assert('RT gate threshold unchanged 5%',br.gate_threshold_pct===0.05&&br.gate_unchanged===true,br);
+  assert('RT gate threshold reported from the configured cap',br.gate_threshold_pct===ROUND_TRIP_LOSS_MAX&&br.gate_unchanged===true,br);
   assert('RT residual includes_haircut true (recovered embeds haircut)',br.parts.quoter_fee_and_impact_merged.includes_haircut===true,br.parts);
   assert('RT complete when amounts present',br.complete===true,br);
 

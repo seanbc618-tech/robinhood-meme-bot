@@ -1,5 +1,5 @@
 /** GROK_SCREENING_V1 - screening schema, checks, funnel, merge. */
-import {CODE_VERSION} from './abc-collect.mjs';
+import {CODE_VERSION,ROUND_TRIP_LOSS_MAX} from './abc-collect.mjs';
 import {zeroAddress} from 'viem';
 import {
   NO_T_DETAIL,diagnoseTargetMinute,mapFxReason,fxStatusFromDiag,evidence,
@@ -75,10 +75,10 @@ export function buildSafetyChecks({pool,holders=null,holdersError=null,roundTrip
       dual.top10_ex_lp.reason||'ok','holders.summary.top10_ex_lp',
       {diagnose_only:true,denominator:dual.top10_ex_lp.denominator,note:dual.top10_ex_lp.note,gate_unchanged:true});
   }
-  if(roundTrip==null) push('round_trip_loss_pct',null,0.05,'UNKNOWN','ROUND_TRIP_NOT_RUN','plannedRoundTrip');
-  else if(roundTrip.loss_pct==null||!Number.isFinite(roundTrip.loss_pct)) push('round_trip_loss_pct',null,0.05,'UNKNOWN','LOSS_PCT_UNKNOWN','plannedRoundTrip');
-  else push('round_trip_loss_pct',roundTrip.loss_pct,0.05,roundTrip.loss_pct<=0.05?'PASS':'FAIL',
-    roundTrip.loss_pct<=0.05?'ok':'ROUND_TRIP_COST_OVER_5_PERCENT','plannedRoundTrip.loss_pct');
+  if(roundTrip==null) push('round_trip_loss_pct',null,ROUND_TRIP_LOSS_MAX,'UNKNOWN','ROUND_TRIP_NOT_RUN','plannedRoundTrip');
+  else if(roundTrip.loss_pct==null||!Number.isFinite(roundTrip.loss_pct)) push('round_trip_loss_pct',null,ROUND_TRIP_LOSS_MAX,'UNKNOWN','LOSS_PCT_UNKNOWN','plannedRoundTrip');
+  else push('round_trip_loss_pct',roundTrip.loss_pct,ROUND_TRIP_LOSS_MAX,roundTrip.loss_pct<=ROUND_TRIP_LOSS_MAX?'PASS':'FAIL',
+    roundTrip.loss_pct<=ROUND_TRIP_LOSS_MAX?'ok':'ROUND_TRIP_COST_OVER_GATE','plannedRoundTrip.loss_pct');
   return checks;
 }
 

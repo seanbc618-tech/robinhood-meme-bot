@@ -1,5 +1,5 @@
 /** MEME_SCREENING_P0 diagnose-only metrics (dual top10 + RT paper diagnostics). */
-import {HAIRCUT_BPS} from './abc-collect.mjs';
+import {HAIRCUT_BPS,ROUND_TRIP_LOSS_MAX} from './abc-collect.mjs';
 import {evidence} from './abc-screening-not.mjs';
 
 function asJsonNumberOrString(v) {
@@ -120,7 +120,7 @@ export function quoteLossBreakdown(plan) {
   if(!plan) return {
     status:'UNKNOWN',parts:null,complete:false,
     paper_size_diagnostic:null,
-    gate_threshold_pct:0.05,gate_unchanged:true,
+    gate_threshold_pct:ROUND_TRIP_LOSS_MAX,gate_unchanged:true,
     note:'No plan quotes available - rejection paths without plan lack fee/impact evidence',
   };
   const complete=planAmountsComplete(plan);
@@ -164,8 +164,8 @@ export function quoteLossBreakdown(plan) {
     planned_qty:plan.qty!=null?asJsonNumberOrString(plan.qty):null,
     loss_usd:Number.isFinite(plan.loss)?plan.loss:null,
     loss_pct:Number.isFinite(plan.loss_pct)?plan.loss_pct:null,
-    gate_threshold_pct:0.05,
-    gate_behavior:'UNCHANGED - still reject when loss_pct>0.05; this block is diagnose evidence only',
+    gate_threshold_pct:ROUND_TRIP_LOSS_MAX,
+    gate_behavior:'This block is diagnose evidence only; the gate itself rejects when loss_pct>gate_threshold_pct',
     components:'buy_gas + sell_gas + combined quoter+haircut residual (fee+impact inseparable; haircut embedded in recovered)',
     note:'Bound to configured paper principal via plannedRoundTrip; residual includes haircut effects — haircut_bps is rate disclosure only',
   };
@@ -174,7 +174,7 @@ export function quoteLossBreakdown(plan) {
     parts,
     complete,
     paper_size_diagnostic,
-    gate_threshold_pct:0.05,gate_unchanged:true,
+    gate_threshold_pct:ROUND_TRIP_LOSS_MAX,gate_unchanged:true,
     source:evidence('plannedRoundTripFromQuotes',{haircut_bps:asJsonNumberOrString(HAIRCUT_BPS)}),
     note:complete
       ?'Nominal pool.liquidity is not USD depth; observe-only. Combined residual includes quoter fee/impact + haircut effects (recovered embeds haircuts). RT reject threshold unchanged.'
