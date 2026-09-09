@@ -102,7 +102,9 @@ export async function sleepUntil(deadline,shouldStop,stepMs=50) {
 
 function isTransientEntry(result) {
   const reasons=[result.skipped,...(result.safety?.reasons||[])].filter(Boolean).join(' ');
-  return /SOURCE_UNAVAILABLE|RPC_TIMEOUT|RPC_DEADLINE|timed out|timeout|429|HOLDER_HISTORY_INCOMPLETE|HOLDER_HISTORY_WARMUP|HOLDER_HISTORY_DEADLINE/i.test(reasons);
+  // Staleness is a timing artifact of a source that refreshes every ~2 minutes, not a verdict
+  // on the signal; the pending window may still find a fresh observation before it expires.
+  return /SOURCE_UNAVAILABLE|RPC_TIMEOUT|RPC_DEADLINE|timed out|timeout|429|HOLDER_HISTORY_INCOMPLETE|HOLDER_HISTORY_WARMUP|HOLDER_HISTORY_DEADLINE|USD_SOURCE_STALE|USD_OBSERVED_STALE|BLOCK_STALE/i.test(reasons);
 }
 
 export async function cycle(store,now=Date.now(),io={}) {
