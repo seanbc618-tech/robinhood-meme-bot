@@ -48,22 +48,37 @@ export function classifyError(error) {
   return 'SOURCE_UNAVAILABLE';
 }
 
+// A stablecoin's risk is losing its peg, not quoting two minutes late. Judging USDG and
+// USDT by the clock rejected a sound 1.0000 quote while accepting a fresh broken one.
+export const STABLE_PEG_MIN=0.98;
+export const STABLE_PEG_MAX=1.02;
+export const STABLE_MAX_AGE_SEC=900;
+export function stablecoinProblem(rates,now=Date.now()/1000) {
+  for(const key of ['tether','global-dollar']) {
+    const price=rates.prices?.[key];
+    if(!price||!Number.isFinite(price.usd)||!(price.usd>0)) return 'USD_SOURCE_MISSING';
+    if(price.usd<STABLE_PEG_MIN||price.usd>STABLE_PEG_MAX) return 'STABLECOIN_OFF_PEG';
+    if(Math.abs(now-price.last_updated_at)>STABLE_MAX_AGE_SEC) return 'STABLECOIN_SOURCE_STALE';
+  }
+  return null;
+}
+// Only ETH prices a live quote; the stablecoins are checked by stablecoinProblem instead.
 export function usdSourceAge(rates,now=Date.now()/1000) {
-  return Math.max(...['ethereum','tether','global-dollar'].map(k=>now-rates.prices[k].last_updated_at));
+  return now-rates.prices.ethereum.last_updated_at;
 }
 export function assertFreshness(block,rates,now=Date.now()/1000) {
   requireValue(Math.abs(now-Number(block.timestamp))<=STALE_SEC,'SOURCE_STALE');
   requireValue(Math.abs(now-rates.observed_at)<=STALE_SEC,'USD_OBSERVED_STALE');
-  for(const key of ['ethereum','tether','global-dollar']) {
-    requireValue(rates.prices[key]&&Number.isFinite(rates.prices[key].usd)&&rates.prices[key].usd>0,'USD_SOURCE_MISSING');
-  }
+  requireValue(rates.prices.ethereum&&Number.isFinite(rates.prices.ethereum.usd)&&rates.prices.ethereum.usd>0,'USD_SOURCE_MISSING');
+  const stable=stablecoinProblem(rates,now);
+  if(stable) requireValue(false,stable);
 }
 export function assertTradeFresh(block,rates,nowMs=Date.now()) {
   const now=nowMs/1000;
   if(Math.abs(now-Number(block.timestamp))>STALE_SEC) return 'BLOCK_STALE';
   if(Math.abs(now-rates.observed_at)>STALE_SEC) return 'USD_OBSERVED_STALE';
   if(usdSourceAge(rates,now)>STALE_SEC) return 'USD_SOURCE_STALE';
-  return null;
+  return stablecoinProblem(rates,now);
 }
 
 export function quoteFresh(blockTs,rateTs,now,limit=STALE_SEC) {

@@ -10,7 +10,7 @@ import {
   collectBuckets,netExitValue,HAIRCUT_BPS,STRATEGY_VERSION,loadBuckets,
   foldStoredEvents,fxContemporaneous,fxForMinute,skipBacklogForLive,saveFxSnap,ensureWatchSlots,logBlocksNeeded,
   HISTORICAL_FX_STALE_SEC,
-  migrateCSize,CYCLE_TARGET_MS,
+  migrateCSize,CYCLE_TARGET_MS,stablecoinProblem,usdSourceAge,assertTradeFresh,STABLE_MAX_AGE_SEC,
   modeledGasUsd,watchSlotDecision,WATCH_MAX_MS,WATCH_POST_MATURITY_MS,rpcRetry,RPC_CALL_TIMEOUT_MS,
 } from './abc-collect.mjs';
 import {
@@ -906,6 +906,38 @@ assert('strategy version is v11',STRATEGY_VERSION==='abc-phase1-v11');
     assert('stop fill is recorded as a paper sell, not a live trade',disk.trades.filter(t=>t.side==='sell').every(t=>t.paper===true&&t.live===false),disk.trades);
     store.close();
   } finally {rmSync(dir,{recursive:true,force:true});}
+}
+
+
+{
+  // Freshness: ETH is judged by the clock, the stablecoins by their peg.
+  const now=1788930000;
+  const rates=(ethAge,usdgUsd,usdgAge,tetherUsd=1.0,tetherAge=10)=>({
+    observed_at:now,
+    prices:{
+      ethereum:{usd:2500,last_updated_at:now-ethAge},
+      tether:{usd:tetherUsd,last_updated_at:now-tetherAge},
+      'global-dollar':{usd:usdgUsd,last_updated_at:now-usdgAge},
+    },
+  });
+  const block={number:1n,timestamp:BigInt(now)};
+  assert('usdSourceAge tracks ETH only',usdSourceAge(rates(30,1.0,800),now)===30,usdSourceAge(rates(30,1.0,800),now));
+  assert('a stablecoin quoted at peg stays usable when its clock is old',
+    stablecoinProblem(rates(5,1.0,800),now)===null&&assertTradeFresh(block,rates(5,1.0,800),now*1000)===null,
+    stablecoinProblem(rates(5,1.0,800),now));
+  assert('an off-peg stablecoin is rejected however fresh it is',
+    stablecoinProblem(rates(5,0.93,1),now)==='STABLECOIN_OFF_PEG',stablecoinProblem(rates(5,0.93,1),now));
+  assert('a stablecoin above the peg band is rejected too',
+    stablecoinProblem(rates(5,1.05,1),now)==='STABLECOIN_OFF_PEG',stablecoinProblem(rates(5,1.05,1),now));
+  assert('a stablecoin source older than the cap is still rejected',
+    stablecoinProblem(rates(5,1.0,STABLE_MAX_AGE_SEC+60),now)==='STABLECOIN_SOURCE_STALE',
+    stablecoinProblem(rates(5,1.0,STABLE_MAX_AGE_SEC+60),now));
+  assert('ETH past 120s still blocks the trade',
+    assertTradeFresh(block,rates(130,1.0,10),now*1000)==='USD_SOURCE_STALE',
+    assertTradeFresh(block,rates(130,1.0,10),now*1000));
+  assert('a broken peg blocks the trade even with fresh ETH',
+    assertTradeFresh(block,rates(5,0.90,5),now*1000)==='STABLECOIN_OFF_PEG',
+    assertTradeFresh(block,rates(5,0.90,5),now*1000));
 }
 
 if(fails.length){console.error('FAILED',fails.length,fails.join(','));process.exitCode=1;}
