@@ -15,7 +15,7 @@ import {
 } from './abc-collect.mjs';
 import {
   cycle,tryEnter,markAndExit,recomputeEquity,applyBuy,applySell,evaluateB,evaluateC,
-  evaluateA,exitDecision,pnlMultiple,nextTickDeadline,sleepUntil,exitOnlyTick,EXIT_TICK_MS,
+  evaluateA,exitDecision,pnlMultiple,nextTickDeadline,sleepUntil,exitOnlyTick,EXIT_TICK_MS,canEnter,applyDayBaseline,
 } from './abc.mjs';
 
 import {ensureRoleWatchSlots,syncCatalog} from './abc-collect.mjs';
@@ -938,6 +938,28 @@ assert('strategy version is v11',STRATEGY_VERSION==='abc-phase1-v11');
   assert('a broken peg blocks the trade even with fresh ETH',
     assertTradeFresh(block,rates(5,0.90,5),now*1000)==='STABLECOIN_OFF_PEG',
     assertTradeFresh(block,rates(5,0.90,5),now*1000));
+}
+
+
+{
+  // Owner pause: no new buys, and it must survive the daily baseline rewrite.
+  const dir=tmp();
+  try {
+    const store=openAbc(dir); initAccounts(store);
+    const a=readAccount(store,'C');
+    a.paused_reason='PAUSED_BY_OWNER'; writeAccount(store,a);
+    assert('a paused account cannot enter',canEnter(readAccount(store,'C'))==='PAUSED_BY_OWNER',canEnter(readAccount(store,'C')));
+    const kept=readAccount(store,'C');
+    applyDayBaseline(kept,Date.now());
+    assert('the daily baseline clears entry_frozen_reason but not the pause',
+      kept.entry_frozen_reason===null&&kept.paused_reason==='PAUSED_BY_OWNER',
+      {frozen:kept.entry_frozen_reason,paused:kept.paused_reason});
+    assert('tryEnter refuses a paused account before any network call',
+      canEnter(kept)==='PAUSED_BY_OWNER',canEnter(kept));
+    const other=readAccount(store,'A');
+    assert('the other accounts are unaffected',canEnter(other)===null,canEnter(other));
+    store.close();
+  } finally {rmSync(dir,{recursive:true,force:true});}
 }
 
 if(fails.length){console.error('FAILED',fails.length,fails.join(','));process.exitCode=1;}

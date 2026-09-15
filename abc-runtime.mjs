@@ -252,11 +252,20 @@ export async function cycle(store,now=Date.now(),io={}) {
   // Warm one watch's full holder history after price collection and catalog.
   // Injected offline collectors never make this extra network request.
   if(!io.collectBuckets&&!io.blockContext&&watch.live.length&&Date.now()+2500<t0+58000) {
-    const row=watch.live[(run.rounds||0)%watch.live.length];
+    // A pool that just signalled is the one whose holder history is about to be needed, so
+    // warm it next instead of waiting its turn: histories run from each token's own birth
+    // block and a rotation of four never catches a pool up before its seat expires.
+    const signalled=new Set(signals.map(s=>s.token));
+    const queue=watch.live.filter(r=>signalled.has(r.token));
+    const from=queue.length?queue:watch.live;
+    const row=from[(run.rounds||0)%from.length];
+    // Collection now finishes well inside its budget; spend the idle remainder here, but
+    // leave the between-cycle exit checks their gap whenever a position is actually open.
+    const warmMs=held.length?12000:35000;
     try {
       const h=await warmHolderHistory(row.token,block.number,{
         birthUpper:row.registered_block??row.first_seen_block,
-        deadline:Math.min(t0+57000,Date.now()+12000),maxChunks:8,
+        deadline:Math.min(t0+50000,Date.now()+warmMs),maxChunks:held.length?8:28,
       });
       run.holder_history={token:row.token,complete:h.complete,stage:h.stage,cursor:h.cursor,at:Date.now()};
     } catch(e) {run.holder_history={token:row.token,error:failure(e),at:Date.now()};}

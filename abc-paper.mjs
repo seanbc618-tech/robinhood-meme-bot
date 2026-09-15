@@ -40,6 +40,9 @@ export function applyDayBaseline(account,now=Date.now()) {
 }
 
 export function canEnter(account) {
+  // Owner-set pause. Unlike entry_frozen_reason this survives applyDayBaseline, and it
+  // stops new buys only: marking, exits and the screening record keep running.
+  if(account.paused_reason) return account.paused_reason;
   if(account.halted_permanent) return 'HALTED_PERMANENT';
   if(account.halted_day) return 'HALTED_DAY_LOSS';
   if(account.entry_frozen_reason) return account.entry_frozen_reason;
