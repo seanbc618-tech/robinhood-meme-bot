@@ -10,9 +10,9 @@
 
 ### 代码与生产位置
 
-- 本地：`<LOCAL_REPO>`，main HEAD `df34290`。**`65aed59`、`df34290` 待在 Mac 上 `git push origin main`**（本 session 环境无 GitHub 凭据）。
+- 本地：`<LOCAL_REPO>`，main HEAD `3acf591`。**`65aed59`、`df34290` 待在 Mac 上 `git push origin main`**（本 session 环境无 GitHub 凭据）。
 - SSH：`<VPS_USER>@<VPS_HOST>`，会话密钥（`authorized_keys` 注释 `cowork-session`）常驻。
-- VPS：`current -> releases/df34290`，PID `1321952`（须重新核实）。`releases/392da39` **持有唯一真实 node_modules，勿删**（详见下文清理章节）。
+- VPS：`current -> releases/3acf591`，PID `1321952`（须重新核实）。`releases/392da39` **持有唯一真实 node_modules，勿删**（详见下文清理章节）。
 - 发布前快照：`shared/deployment-{...,aae5c26,65aed59,df34290}-before.json`；延长实验前快照：`shared/experiment-extend-before.json`。
 
 ### 8 个回合的结果与最重要的发现
@@ -44,6 +44,18 @@
 用户明确要求延长而非清零账户。`staging/extend-experiment.py` 在停机后把 `ends_at` 从 `1789843084975`（2026-09-19 18:38 UTC）改为 `1791052684975`（2026-10-03 18:38 UTC），`hours` 336→672，并在 run 里留下 `experiment_extended` 记录（含分界 release `df34290`）。`started_at=1788633484975` 未动；三个账户 payload 的 SHA256 在改动前后**逐个字节一致**。**账户、成交历史没有清零，也不应清零**——上表是目前唯一的真实证据。
 
 如需"干净的对照"，用分界点统计而不是抹掉历史：`df34290` 部署之后的成交单独归组，与 8% 闸期间对比。
+
+### 2026-09-15：C 已暂停，持有人预热已提速（`3acf591`）
+
+**9 个完整回合后的战绩：1 胜 8 负，合计 -40.21 / 3000（-1.34%）。** 按策略：A 0 胜 2 负（-10.36）、B 1 胜 1 负（+9.57）、C **0 胜 5 负（-39.42）**。C 平均 3.7 分钟就被止损，它的规则买的是毕业 30 分钟–6 小时的新池，正是崩得最快的一类。用户据此决定暂停 C。
+
+- **暂停机制**：`canEnter` 新增 `account.paused_reason` 检查。不能用 `entry_frozen_reason`——`applyDayBaseline` 每轮都会把它清空。C 的账户已写入 `paused_reason="PAUSED_BY_OWNER_0_FOR_5"`。**只挡新买入**：估值、退出、筛选记录照常，C 仍然免费记录"它本来会怎么做"。A/B 的 `paused_reason` 为 null。恢复 C 只需把该字段清空。
+- **持有人预热**：原来每轮只轮到 4 个槽中的 1 个、每次 8 段×5000 块=4 万块，而每个 token 要从**自己的出生区块**扫到链头。实测部署前：4 个观察池分别距链头 605 / 127 万 / 212 万块 / 未开始；分界后出信号未成交的 8 个池有 7 个落后 50 万–212 万块。一个落后 120 万块的池按旧速度需约 13 小时，而 C 的槽位只有 6 小时——很多池到期都没扫完，于是 `HOLDERS_NOT_FETCHED` 吃掉了 9 个信号。
+- 改法两点：本轮出过信号的池**插队优先预热**；采集现在约 18 秒就跑完 60 秒预算，空闲部分给预热用（35 秒 / 28 段，原 12 秒 / 8 段）。**有持仓时自动退回 12 秒 / 8 段**，保证两轮之间仍有空隙给 15 秒退出复查。
+- 部署后实测：一次预热推进 **18 万块**（原 4 万），cycle 18s→38s，`failed_rounds` 未增加，游标仍追平链头，ETH 源年龄 3.5 秒。
+- 停机快照 `shared/deployment-3acf591-before.json`；三账户经济字段（cash/equity/realized/unrealized/positions/trades/created_at/closed_rounds）部署前后逐项一致，实验起止时间未变。
+
+**重要判断**：前几轮修的都是管道（RPC、价格源、退出滞后、成本闸），现在数据 100% 可用、闸正常工作。管道通了之后露出来的是**策略本身还没显出优势**：9 次买入 8 次直接跌。后续应把重心放在 B（唯一盈利的策略），不要再靠调门槛找收益。
 
 ### 新 session 下一步顺序
 
