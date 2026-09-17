@@ -71,6 +71,28 @@
 - 教训写在这里：持有人历史只影响已经产生的信号能不能过安全检查，而采集决定有没有信号。**预算冲突时采集优先。**
 - 回退后实测：`rpc_profile` 恢复 17 次调用/合计 8.3 秒/最慢 506ms（原为 0 次），目录本轮推进 4500 块（原为 0），滞后开始收敛，预计约 2.5 小时追平。
 
+### 2026-09-17：worker 已交给 systemd 托管（`abc-paper.service`）
+
+此前没有任何守护：进程死了或主机重启都不会自己起来，而表现出来就是"没有 Telegram 消息"，与"这几天没信号"无法区分。用户要求装 systemd。
+
+- 单元文件 `/etc/systemd/system/abc-paper.service`，`User=sean`，已 `enable`（开机自启）。`Restart=on-failure` + `RestartSec=15`：崩溃或被信号杀掉才拉起；**实验到期的正常退出不会被拉起**，`systemctl stop` 也不会。`KillSignal=SIGTERM` + `TimeoutStopSec=180`，让 worker 跑完当前一轮再退。日志仍追加到 `shared/data/abc/process.log`。
+- **踩到一个隐蔽的坑（务必记住）**：`abc.mjs` 的 main 判断是 `resolve(process.argv[1]) === fileURLToPath(import.meta.url)`，而 Node 会把 `import.meta.url` 解析成**真实路径**。因此用 `current` 这个符号链接去调用时两边不相等，整个 main 块被跳过，进程什么都不做就退出 0 —— 第一版单元就是这样静默失败的。解决办法是启动时先解析：`ExecStart=/bin/sh -c 'exec /usr/bin/node "$(readlink -f <VPS_ROOT>/current)/abc.mjs" worker 336'`。这样发布时只需切 `current` 再 `systemctl restart`，不用改单元。
+- 另一个相关点：worker 收到 SIGTERM 时会写 `stop.json`，而 `worker()` 启动时会把它删掉（`abc-runtime.mjs` 第 320 行）。所以 `systemctl start` 永远能正常起来，不会被上次停机留下的 `stop.json` 卡住。
+- **实测通过**：`kill -9` 主进程后 **20 秒内自动拉起**（新 PID 1525161，`NRestarts=1`，active/running），三个账户 payload 逐字节未变，C 的暂停标记保留，`started_at`/`ends_at` 未变。开机自启只验证了 `UnitFileState=enabled`，没有真的重启主机去证。
+
+**发布流程随之改变（旧流程会产生脱离 systemd 的游离进程）：**
+
+1. 准备新 release 目录（`cp -a` 上一个再替换改动文件），跑三组检查
+2. 只读导出停机前快照
+3. `sudo systemctl stop abc-paper`（优雅，最多等 180 秒）
+4. 原子切换 `current` 符号链接
+5. `sudo systemctl start abc-paper`
+6. 核对账户经济字段与实验起止时间
+
+**不要再用** `node abc.mjs start 336`：那会 spawn 一个 systemd 管不到的 detached 进程。也不要直接对主进程发 SIGTERM —— 它会干净退出（exit 0），而 `on-failure` 不会拉起它。
+
+常用命令：`systemctl status abc-paper`、`sudo systemctl restart abc-paper`、`sudo journalctl -u abc-paper -n 50`。
+
 ### 新 session 下一步顺序
 
 1. 只读核实 current、PID cwd、run、accounts；看 `df34290` 之后有没有新的完整回合，以及新回合的入场成本分布。
