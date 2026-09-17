@@ -259,13 +259,15 @@ export async function cycle(store,now=Date.now(),io={}) {
     const queue=watch.live.filter(r=>signalled.has(r.token));
     const from=queue.length?queue:watch.live;
     const row=from[(run.rounds||0)%from.length];
-    // Collection now finishes well inside its budget; spend the idle remainder here, but
-    // leave the between-cycle exit checks their gap whenever a position is actually open.
-    const warmMs=held.length?12000:35000;
+    // Keep this small. Raising it to 28 chunks tripled the log request rate, the public
+    // endpoint answered 429, and the 30s pause that follows dumped collection onto the
+    // 10-block Alchemy path: the live cursor fell 588k blocks behind and cycles reported
+    // analyzed=0. Holder history only gates safety on signals that occur; collection is
+    // what produces them, so collection wins the budget.
     try {
       const h=await warmHolderHistory(row.token,block.number,{
         birthUpper:row.registered_block??row.first_seen_block,
-        deadline:Math.min(t0+50000,Date.now()+warmMs),maxChunks:held.length?8:28,
+        deadline:Math.min(t0+57000,Date.now()+12000),maxChunks:8,
       });
       run.holder_history={token:row.token,complete:h.complete,stage:h.stage,cursor:h.cursor,at:Date.now()};
     } catch(e) {run.holder_history={token:row.token,error:failure(e),at:Date.now()};}
