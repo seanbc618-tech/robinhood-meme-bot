@@ -41,7 +41,11 @@ if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url)) {
   } else if(cmd==='run') {
     worker(Number(process.argv[3]||DEFAULT_HOURS),true).catch(e=>{console.error(failure(e));process.exitCode=1;});
   } else if(cmd==='worker') {
-    worker(Number(process.argv[3]||DEFAULT_HOURS),false).catch(e=>{console.error(failure(e));process.exitCode=1;});
+    // If the event loop empties while the worker is still mid-run, Node exits 0 and systemd
+    // (Restart=on-failure) leaves it dead; that cost 9 hours on 2026-09-22. Make it a failure.
+    let settled=false;
+    process.on('beforeExit',()=>{if(!settled){console.error('WORKER_STALLED event loop emptied mid-run');process.exit(1);}});
+    worker(Number(process.argv[3]||DEFAULT_HOURS),false).then(()=>{settled=true;},e=>{settled=true;console.error(failure(e));process.exitCode=1;});
   } else if(cmd==='status') printStatus(dir);
   else if(cmd==='stop') {
     save(resolve(dir,'stop.json'),{requested_at:Date.now()});
