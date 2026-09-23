@@ -161,7 +161,23 @@ export async function cycle(store,now=Date.now(),io={}) {
   const rpcProfile=[];
   let deferred=0;
   const rpcIo={...io,deadline:collectDeadline,rpcProfile,rpcEpoch:io.rpcEpoch||0};
+  // A cycle runs 20-45 s but marked held positions only at its start, so the 15 s exit check
+  // held only between cycles: a stop could sit up to a minute. Check again between steps.
+  let lastExitCheck=Date.now();
+  const exitCheck=async()=>{
+    if(Date.now()-lastExitCheck<EXIT_TICK_MS||!['A','B','C'].some(s=>accounts[s].positions.length)) return;
+    lastExitCheck=Date.now();
+    try {
+      const tick=await exitOnlyTick(store,lastExitCheck,io);
+      if(tick.checked) {const r=readRun(store);r.exit_ticks=(r.exit_ticks||0)+1;r.last_exit_tick_at=Date.now();writeRun(store,r);}
+    } catch(error) {
+      const r=readRun(store);r.last_exit_tick_error={error:failure(error),kind:classifyError(error),at:Date.now()};writeRun(store,r);
+    }
+    // The tick wrote the accounts; later steps must not write back stale copies over its exits.
+    for(const s of ['A','B','C']) accounts[s]=readAccount(store,s);
+  };
   for(const row of [...held.map(t=>store.db.prepare('SELECT * FROM pools WHERE token=?').get(t)).filter(Boolean),...queue]) {
+    await exitCheck();
     if(analyzed.includes(row.token)) continue;
     if(Date.now()>collectDeadline) {deferred++;continue;}
     try {
@@ -253,6 +269,7 @@ export async function cycle(store,now=Date.now(),io={}) {
     try {run.catalog_backfill=await syncCatalog(store,block,{...io,catalogMaxBlocks:6000n,deadline:Math.min(t0+53000,Date.now()+8000)});}
     catch(error) {run.last_pool_error={token:null,error:failure(error),kind:classifyError(error),at:Date.now()};}
   }
+  await exitCheck();
   // Warm one watch's full holder history after price collection and catalog.
   // Injected offline collectors never make this extra network request.
   if(!io.collectBuckets&&!io.blockContext&&watch.live.length&&Date.now()+2500<t0+58000) {
@@ -276,6 +293,7 @@ export async function cycle(store,now=Date.now(),io={}) {
       run.holder_history={token:row.token,complete:h.complete,stage:h.stage,cursor:h.cursor,at:Date.now()};
     } catch(e) {run.holder_history={token:row.token,error:failure(e),at:Date.now()};}
   }
+  await exitCheck();
   Object.assign(run,readRun(store),{
     status:run.status,last_started_at:run.last_started_at,code_version:CODE_VERSION,exits_ms:run.exits_ms,
     live_watch:run.live_watch,last_pool_error:run.last_pool_error,
