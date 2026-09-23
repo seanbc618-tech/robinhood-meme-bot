@@ -11,7 +11,7 @@ import {
   markV1BucketsInvalid,CODE_VERSION,COLLECT_BUDGET_MS,
   slimSignalResult,poolFromRow,isolateNonContemporaneousFx,
   pickLiveWatch,skipBacklogForLive,LIVE_WATCH_N,saveFxSnap,logBlocksNeeded,
-  extendActiveWatchBounds,migrateCSize,
+  extendActiveWatchBounds,migrateCSize,invalidateCarriesAcrossGaps,
 } from './abc-collect.mjs';
 import {
   recordEvalFromCycle,ensureScreeningSchema,
@@ -369,6 +369,8 @@ export async function worker(hours,foreground=false) {
       run.code_version=CODE_VERSION;
       writeRun(store,run);
     }
+    const carried=invalidateCarriesAcrossGaps(store);
+    if(run&&carried) {run.gap_carries_invalidated=(run.gap_carries_invalidated||0)+carried;writeRun(store,run);}
     const now=Date.now();
     if(!run||!run.started_at) {
       if(!Number.isFinite(hours)||hours<=0||hours>DEFAULT_HOURS) throw new Error('Hours must be in (0,336]');

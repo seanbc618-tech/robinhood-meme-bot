@@ -921,6 +921,33 @@ export async function foldStoredEvents(store,row,pool,block,rates,io={}) {
   return {minutes:store.db.prepare('SELECT count(*) c FROM buckets WHERE token=? AND IFNULL(invalid,0)=0').get(token).c,closed,lastFull};
 }
 
+// Until the per-minute carry lookup, a quiet minute after a skipped stretch copied the price from before it.
+// Those rows still sit in the strategy windows and would seed new quiet minutes. Keep a quiet
+// minute only if it holds the last trade seen since its gap; declare the rest invalid.
+// Idempotent: quiet minutes the current fold writes always pass.
+export function invalidateCarriesAcrossGaps(store) {
+  const gaps=store.db.prepare(`SELECT token,to_block,to_ts FROM coverage_gaps
+    WHERE reason='LIVE_SUBSCRIBE_SKIP_BACKLOG' AND to_ts IS NOT NULL ORDER BY token,to_ts`).all();
+  const trades=store.db.prepare('SELECT ts,sqrt FROM swap_events WHERE token=? AND block>? AND ts<? ORDER BY block,log_index');
+  const quiet=store.db.prepare('SELECT minute,close_sqrt FROM buckets WHERE token=? AND no_trade=1 AND IFNULL(invalid,0)=0 AND minute>=? AND minute<? ORDER BY minute');
+  const drop=store.db.prepare(`UPDATE buckets SET invalid=1,usd_usable=0,miss_reason='CARRIED_ACROSS_GAP' WHERE token=? AND minute=?`);
+  let n=0;
+  store.db.exec('BEGIN');
+  try {
+    gaps.forEach((g,i)=>{
+      const end=gaps[i+1]?.token===g.token?minuteStart(gaps[i+1].to_ts):Number.MAX_SAFE_INTEGER;
+      const seen=trades.all(g.token,g.to_block,end);
+      let j=0,last=null;
+      for(const b of quiet.all(g.token,minuteStart(g.to_ts),end)) {
+        while(j<seen.length&&seen[j].ts<b.minute) last=seen[j++].sqrt;
+        if(last!==b.close_sqrt) {drop.run(g.token,b.minute);n++;}
+      }
+    });
+    store.db.exec('COMMIT');
+  } catch(e) {store.db.exec('ROLLBACK');throw e;}
+  return n;
+}
+
 export function plannedRoundTripFromQuotes(buy,sell,pool,principalUsd,qty,rates,gasPrice,haircutBps=HAIRCUT_BPS) {
   const px=quoteUsd(pool,rates);
   const sellUsd=Number(formatUnits(haircutQty(sell.amountOut,haircutBps),pool.quoteDecimals))*px;
