@@ -823,9 +823,14 @@ export async function foldStoredEvents(store,row,pool,block,rates,io={}) {
   const workMinutes=[...new Set([...closable,...lateRetrySet])].sort((a,b)=>a-b);
   if(!workMinutes.length) return {minutes:store.db.prepare('SELECT count(*) c FROM buckets WHERE token=? AND IFNULL(invalid,0)=0').get(token).c,closed:[],lastFull};
   const infra=io.infra||await infraSet(pool.curve||row.curve,block.number);
-  let lastPrice=null,lastSqrt=null;
-  const prev=store.db.prepare('SELECT close_usd,close_sqrt FROM buckets WHERE token=? AND close_usd IS NOT NULL AND IFNULL(invalid,0)=0 AND IFNULL(usd_usable,0)=1 ORDER BY minute DESC LIMIT 1').get(token);
-  if(prev) {lastPrice=prev.close_usd;lastSqrt=prev.close_sqrt;}
+  // A no-trade minute keeps the last seen on-chain price, valued at that minute's own FX. It looks
+  // the price up per minute: a running carry leaked a late retry's older price into newer minutes,
+  // skipped over traded minutes whose FX was unusable, and ran straight across skipped stretches.
+  const skips=store.db.prepare(`SELECT to_ts FROM coverage_gaps WHERE token=? AND reason='LIVE_SUBSCRIBE_SKIP_BACKLOG' AND to_ts IS NOT NULL`)
+    .all(token).map(g=>Number(g.to_ts));
+  const lastSeen=store.db.prepare('SELECT close_sqrt FROM buckets WHERE token=? AND minute<? AND minute>? AND IFNULL(invalid,0)=0 AND close_sqrt IS NOT NULL ORDER BY minute DESC LIMIT 1');
+  // After a skipped stretch the price is unknown until the next trade, not flat.
+  const carryFor=minute=>lastSeen.get(token,minute,Math.max(-1,...skips.filter(t=>t<minute)));
   const insert=store.db.prepare(`INSERT INTO buckets
     (token,minute,open_usd,high_usd,low_usd,close_usd,volume_usd,buy_usd,sell_usd,net_inflow_usd,buy_recipients,
      buy_recipient_count,swap_count,no_trade,executable,from_block,to_block,collected_at,source_block,close_sqrt,invalid,fx_note,usd_usable,miss_reason)
@@ -845,14 +850,6 @@ export async function foldStoredEvents(store,row,pool,block,rates,io={}) {
   try {
     for(const minute of workMinutes) {
       const lateRetry=lateRetrySet.has(minute);
-      // A late retry can be older than the current cursor.  Re-seed the
-      // no-trade carry-forward from the last valid bucket strictly before it;
-      // never use a future bucket as a historical price.
-      if(lateRetry) {
-        const prior=store.db.prepare('SELECT close_usd,close_sqrt FROM buckets WHERE token=? AND minute<? AND close_usd IS NOT NULL AND IFNULL(invalid,0)=0 AND IFNULL(usd_usable,0)=1 ORDER BY minute DESC LIMIT 1').get(token,minute);
-        lastPrice=prior?.close_usd??null;
-        lastSqrt=prior?.close_sqrt??null;
-      }
       const fx=fxForMinute(store,minute,pool.quote);
       const usable=fx.ok;
       const pxUse=usable?fx.px:quoteUsd(pool,rates);
@@ -861,10 +858,7 @@ export async function foldStoredEvents(store,row,pool,block,rates,io={}) {
         ? `fx_snap observed_at=${fx.rates.observed_at} last_updated=${ethUpdated(fx.rates,pool.quote)} CONTEMPORANEOUS${lateRetry?';late_fx_retry':''}`
         : `fx_snap reason=${fx.reason}`;
       const existing=store.db.prepare('SELECT minute,close_usd,close_sqrt,invalid,usd_usable FROM buckets WHERE token=? AND minute=?').get(token,minute);
-      if(existing&&(!lateRetry||existing.invalid||existing.usd_usable)) {
-        if(!existing.invalid&&existing.usd_usable&&existing.close_usd>0) {lastPrice=existing.close_usd;lastSqrt=existing.close_sqrt;}
-        continue;
-      }
+      if(existing&&(!lateRetry||existing.invalid||existing.usd_usable)) continue;
       const swaps=store.db.prepare(`SELECT * FROM swap_events WHERE token=? AND ts>=? AND ts<? ORDER BY ts,block,log_index`).all(token,minute,minute+60);
       const xfers=store.db.prepare(`SELECT * FROM transfer_events WHERE token=? AND ts>=? AND ts<?`).all(token,minute,minute+60);
       const xferByTx=new Map();
@@ -872,9 +866,11 @@ export async function foldStoredEvents(store,row,pool,block,rates,io={}) {
         const list=xferByTx.get(tr.tx)||[];list.push(tr);xferByTx.set(tr.tx,list);
       }
       if(!swaps.length) {
-        if(!(lastPrice>0)||!usable) {noteStatus.run(token,minute,usable?'NOT_COLLECTED':(fx.reason||'NO_FX_SNAP'),collectedAt);continue;}
-        insert.run(token,minute,lastPrice,lastPrice,lastPrice,lastPrice,0,0,0,0,'{}',0,0,1,0,
-          null,null,collectedAt,Number(block.number),lastSqrt,0,fxNote,1,null);
+        const prior=usable?carryFor(minute):null;
+        const px=prior?sqrtPriceToUsd(pool,BigInt(prior.close_sqrt),fx.rates):null;
+        if(!(px>0)) {noteStatus.run(token,minute,usable?'NOT_COLLECTED':(fx.reason||'NO_FX_SNAP'),collectedAt);continue;}
+        insert.run(token,minute,px,px,px,px,0,0,0,0,'{}',0,0,1,0,
+          null,null,collectedAt,Number(block.number),prior.close_sqrt,0,fxNote,1,null);
         if(lateRetry) clearStatus.run(token,minute);
         closed.push(minute);continue;
       }
@@ -901,8 +897,7 @@ export async function foldStoredEvents(store,row,pool,block,rates,io={}) {
           if(total>0n) for(const [a,v] of positive) recipients[a]=(recipients[a]||0)+usdVol*Number(v)/Number(total);
         } else if(tokenAmount<0n&&quoteAmount>0n) {sell+=usdVol;net-=usdVol;}
       }
-      if(usable) {lastPrice=close;lastSqrt=swaps[swaps.length-1].sqrt;}
-      else noteStatus.run(token,minute,fx.reason||'NO_FX_SNAP',collectedAt);
+      if(!usable) noteStatus.run(token,minute,fx.reason||'NO_FX_SNAP',collectedAt);
       insert.run(token,minute,open,high,low,close,volume,buy,sell,net,JSON.stringify(recipients),
         Object.keys(recipients).length,swaps.length,0,1,swaps[0].block,swaps[swaps.length-1].block,
         collectedAt,Number(block.number),swaps[swaps.length-1].sqrt,0,fxNote,usable?1:0,usable?null:fx.reason);
@@ -1013,7 +1008,8 @@ export async function skipBacklogForLive(store,row,block,io={}) {
   catch(error) {throw new Error('SOURCE_UNAVAILABLE coverage_boundary');}
   store.db.prepare(`INSERT INTO coverage_gaps(token,from_block,to_block,from_ts,to_ts,reason,at) VALUES(?,?,?,?,?,?,?)`)
     .run(row.token,Number(cur)+1,Number(jumpTo),null,toTs,'LIVE_SUBSCRIBE_SKIP_BACKLOG',Date.now());
-  const complete=minuteStart(toTs)-60;
+  // The minute holding the jump point is only partly observed; the first full minute is the next.
+  const complete=minuteStart(toTs);
   store.db.prepare(`UPDATE pools SET last_event_block=?,last_cursor_block=?,live_from_block=?,live_from_ts=?,last_complete_minute=? WHERE token=?`)
     .run(Number(jumpTo),Number(jumpTo),Number(jumpTo),toTs,complete,row.token);
   row.last_event_block=Number(jumpTo);
