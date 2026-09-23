@@ -46,6 +46,16 @@ export async function withRpcDeadline(fn,ms,label) {
   try {return await rpcScope.run(signal,fn);} finally {clearTimeout(timer);}
 }
 const rpcQueues=new Map();
+// Settle on abort even if p never does. Node's fetch can leave a gzip body read pending forever
+// when the abort lands just as the body completes, and a queued request only saw its abort once
+// dequeued; together they wedged the origin queue and the worker exited 0 (2026-09-22).
+function untilAbort(p,signal) {
+  if(!signal) return p;
+  return Promise.race([p,new Promise((_,reject)=>{
+    if(signal.aborted) reject(signal.reason);
+    else signal.addEventListener('abort',()=>reject(signal.reason),{once:true});
+  })]);
+}
 function scopedFetch(url,options={}) {
   const scope=rpcScope.getStore();
   const signal=scope?AbortSignal.any([scope,...(options.signal?[options.signal]:[])]):options.signal;
@@ -64,11 +74,11 @@ function scopedFetch(url,options={}) {
     q.next=Date.now()+(key.includes('quiknode')?1200:250);
     // Consume the body before releasing the queue, not just the HTTP headers.
     const response=await fetch(url,{...options,signal});
-    const body=await response.arrayBuffer();
+    const body=await untilAbort(response.arrayBuffer(),signal);
     return new Response(body,{status:response.status,statusText:response.statusText,headers:response.headers});
   });
   q.tail=request.catch(()=>{});
-  return request;
+  return untilAbort(request,signal);
 }
 function rpcHttp(url,options={}) {return http(url,{...options,fetchFn:scopedFetch});}
 const readTransport = rpcHttp(
