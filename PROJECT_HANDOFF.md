@@ -15,7 +15,7 @@
 - `e0c1565`：观察中的池落后超过 36000 块（约 1 小时）会重新跳到最新，跳过段记 `LIVE_SUBSCRIBE_SKIP_BACKLOG` 缺口，不补数据。部署后两个座位首轮追平。
 - `8c627cf`：worker 运行中若事件循环清空（Node 以 0 退出，`Restart=on-failure` 不拉起），改为打印 `WORKER_STALLED` 并 exit 1，由 systemd 15 秒内重启。起因：09-22 19:40:07 UTC worker 在一轮开始后 6 秒以状态 0 退出，无信号、无 stop.json、无日志，停了 9 小时。
 - **该退出的根因已查明，并在 VPS 的 Node 22.23.1 上复现**：Node 内置 fetch 的缺陷——abort 恰好落在 gzip 响应体刚收完时，`response.arrayBuffer()` 永不结束且不占任何句柄（VPS 上 300 次试验 14 次挂死，未压缩 0 次）；公共节点对所有响应都回 `content-encoding: gzip`。`scopedFetch` 按域名串行排队，这个挂起请求让同域名的后续请求永远排队；排队中的请求又不响应 viem 的超时（viem 2.56.3 `withTimeout({signal:true})` 只 abort、自己不 reject），于是下一轮首个读请求在 6 秒（readTransport 超时）后事件循环清空，进程退出 0。读和日志共用公共节点队列后才暴露。**已修复并部署 `4205d54`**：`scopedFetch` 的响应体读取和返回给调用方的 promise 都与 abort 赛跑（`untilAbort`），队列仍按域名一次一个。用真实 chain.mjs + 本地 gzip RPC 验证：修复前 8 次超时后队列死亡、下一轮开始 6.008 秒后进程退出 0；修复后 VPS 同版本 Node 上两次各 60 次超时，Node 的挂起分别发生 5 次和 8 次，队列始终存活；排队中被取消的请求按时（500ms）返回而非晚 2.8 秒，下一个请求仍等前一个结束。
-- **全面扫描发现的其余 5 个问题（均未修，用户要求先记下）**：清单、修法方向和代码位置见仓库根目录 `TODO.md`，修完一条就在那里打勾。按建议顺序：数据没收齐就判分钟；缺口后沿用旧价格；一轮之内不查止损；一个价格源失败整轮作废；砸盘后仓位可能无法估值（潜在）。**更正此前说法**：退出修复后超额并未稳定在 1–4 个点，之后 A 两笔 8.6/8.9 点、C 一笔 10.3 点。
+- **扫描发现的其余 5 个问题已全部修复并部署（`releases/3467e8b`，09-23 11:59 UTC）**，逐条见 `TODO.md`：数据没收齐不判分钟（`d0d54b0`）；无成交分钟不跨缺口沿用价格（`9615cdb`），启动时把旧代码编出的 2016 个假分钟标为 `CARRIED_ACROSS_GAP` 无效（`10b9728`，`run.gap_carries_invalidated`）；一轮内每 15 秒补查退出（`b14f56b`、`a498af8`）；稳定币报价失败不再让整轮作废，买入仍按冻结规则挡住（`3434e12`、`ddbde54`）；持有人名单失效时刷新（`b51e43f`、`3467e8b`）。每条都有离线复现，修复前失败、修复后通过（脚本未入库）；另有一个子代理独立审查，查出的 6 个问题已在上述后续提交里修掉。部署后首两轮：目录滞后 0、`analyzed=4`、`COVERAGE_NOT_CLOSED` 为 0、账户与实验时间逐字段未变。4 笔已平仓交易的入场前 8 小时窗口里有过这类假分钟（B 的 +50.4% 那笔有 126 个，最近的在入场前 132 分钟），已成交结果不回改。**更正此前说法**：退出修复后超额并未稳定在 1–4 个点，之后 A 两笔 8.6/8.9 点、C 一笔 10.3 点。
   - 已核对无问题：成本闸与账本首次标价差 0.03–0.87 个点（12 笔买入，中位约 0.24），可忽略；账本算术、重复买卖、前视偏差未发现问题。
   - 次要：换座位时会补判离开期间的全部分钟（`evaluated_minutes` 无上限），污染筛选统计；已暂停的 C 仍占持有人预热轮转。
 
@@ -24,10 +24,10 @@
 
 ### 代码与生产位置
 
-- 本地：`<LOCAL_REPO>`，main HEAD 为本文档提交（其前 `4205d54`、`cc892b2`、`8c627cf`、`e0c1565`）。**`98efe57` 之后的提交都待在 Mac 上 `git push origin main`**（本 session 环境无 GitHub 凭据）。
+- 本地：`<LOCAL_REPO>`，main HEAD 为本文档提交（其前 `3467e8b` 等 9 个修复提交）。**`d0a0329` 之后的提交待在 Mac 上 `git push origin main`**（本 session 环境无 GitHub 凭据）。
 - SSH：`<VPS_USER>@<VPS_HOST>`，会话密钥（`authorized_keys` 注释 `cowork-session`）常驻。
-- VPS：`current -> releases/4205d54`，PID `1729626`（须重新核实），systemd 托管。`releases/392da39` **持有唯一真实 node_modules，勿删**（详见下文清理章节）。
-- 发布前快照：`shared/deployment-{...,aae5c26,65aed59,df34290,d9fb80c,e0c1565,8c627cf,4205d54}-before.json`；延长实验前快照：`shared/experiment-extend-before.json`。
+- VPS：`current -> releases/3467e8b`，PID `1734578`（须重新核实），systemd 托管。`releases/392da39` **持有唯一真实 node_modules，勿删**（详见下文清理章节）。
+- 发布前快照：`shared/deployment-{...,aae5c26,65aed59,df34290,d9fb80c,e0c1565,8c627cf,4205d54,3467e8b}-before.json`；延长实验前快照：`shared/experiment-extend-before.json`。
 
 ### 8 个回合的结果与最重要的发现
 
