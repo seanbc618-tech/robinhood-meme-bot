@@ -470,13 +470,16 @@ export async function usdRates() {
   ]);
   if(eth.status==='rejected') throw eth.reason;
   const usdg=gecko.status==='fulfilled'?gecko.value?.['global-dollar']:null;
+  // A quote with no timestamp cannot pass the 900 s rule, so it counts as missing.
   const prices={ethereum:eth.value,tether:usdt.status==='fulfilled'?usdt.value:null,
-    'global-dollar':usdg&&Number.isFinite(usdg.usd)&&usdg.usd>0?{usd:usdg.usd,last_updated_at:usdg.last_updated_at}:null};
+    'global-dollar':usdg&&Number.isFinite(usdg.usd)&&usdg.usd>0&&Number.isFinite(usdg.last_updated_at)
+      ?{usd:usdg.usd,last_updated_at:usdg.last_updated_at}:null};
   const now=Date.now()/1000;
   requireValue(Math.abs(now-prices.ethereum.last_updated_at)<=300,'USD_SOURCE_STALE');
   const result={source:`${COINBASE_TICKER}/{ETH-USD,USDT-USD}/ticker + coingecko:global-dollar`,
     observed_at:Math.floor(Date.now()/1000),prices};
-  save(resolve(ROOT,'data/rates',`${result.observed_at}.json`),result);
+  // ledger.mjs reads these files and expects all three prices.
+  if(prices.tether&&prices['global-dollar']) save(resolve(ROOT,'data/rates',`${result.observed_at}.json`),result);
   return result;
 }
 export function quoteUsd(pool,rates) {

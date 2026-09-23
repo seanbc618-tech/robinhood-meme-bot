@@ -119,7 +119,9 @@ function isTransientEntry(result) {
   const reasons=[result.skipped,...(result.safety?.reasons||[])].filter(Boolean).join(' ');
   // Staleness is a timing artifact of a source that refreshes every ~2 minutes, not a verdict
   // on the signal; the pending window may still find a fresh observation before it expires.
-  return /SOURCE_UNAVAILABLE|RPC_TIMEOUT|RPC_DEADLINE|timed out|timeout|429|HOLDER_HISTORY_INCOMPLETE|HOLDER_HISTORY_WARMUP|HOLDER_HISTORY_DEADLINE|USD_SOURCE_STALE|USD_OBSERVED_STALE|BLOCK_STALE/i.test(reasons);
+  // A stablecoin problem used to fail the whole cycle, which left pending signals for the next
+  // one; now that the cycle runs through it, keep them pending the same way.
+  return /SOURCE_UNAVAILABLE|RPC_TIMEOUT|RPC_DEADLINE|timed out|timeout|429|HOLDER_HISTORY_INCOMPLETE|HOLDER_HISTORY_WARMUP|HOLDER_HISTORY_DEADLINE|USD_SOURCE_STALE|USD_OBSERVED_STALE|BLOCK_STALE|USD_SOURCE_MISSING|STABLECOIN_SOURCE_STALE|STABLECOIN_OFF_PEG/i.test(reasons);
 }
 
 export async function cycle(store,now=Date.now(),io={}) {

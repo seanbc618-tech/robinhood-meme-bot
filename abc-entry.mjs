@@ -2,7 +2,7 @@ import {failure} from './chain.mjs';
 import {
   readAccount,writeAccount,plannedRoundTrip,plannedRoundTripFromQuotes,netExitValue,
   requireRoundTrip,haircutQty,HAIRCUT_BPS,STRATEGY_VERSION,ROUND_TRIP_LOSS_MAX,
-  classifyError,quoteExact,assertTradeFresh,poolFor,
+  classifyError,quoteExact,assertTradeFresh,poolFor,stablecoinProblem,
 } from './abc-collect.mjs';
 import {
   applyDayBaseline,canEnter,applyBuy,applySell,exitDecision,sellQtyFor,recomputeEquity,pnlMultiple,
@@ -85,6 +85,10 @@ export async function tryEnter(store,account,token,signal,pool,block,rates,gasPr
   if(frozen) {count(account,frozen);writeAccount(store,account);return {skipped:frozen};}
   if(account.seen.includes(token)) {count(account,'ALREADY_OWNED');writeAccount(store,account);return {skipped:'ALREADY_OWNED'};}
   if(Number(block.timestamp)<signal.minute+60) {count(account,'FILL_BEFORE_SIGNAL_COMPLETE');writeAccount(store,account);return {skipped:'FILL_BEFORE_SIGNAL_COMPLETE'};}
+  // Any stablecoin problem blocks every entry: say so before ~30 RPC calls of screening and
+  // simulation. The reason is transient, so the signal stays pending for its 3 minutes.
+  const stable=stablecoinProblem(rates,clock()/1000);
+  if(stable) {count(account,stable);writeAccount(store,account);return {skipped:stable};}
   // Collection can use a lightweight row-shaped pool. Entry checks and quotes
   // require the live liquidity, sqrt price, full PoolKey, and launch metadata.
   // Hydrate only incomplete cached objects so test/injected full pools remain
