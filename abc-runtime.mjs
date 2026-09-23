@@ -169,10 +169,13 @@ export async function cycle(store,now=Date.now(),io={}) {
       const pool=cached||await (io.enrichPool||enrichPool)(store,row.token,block.number);
       if(!io.skipLiveJump) await skipBacklogForLive(store,row,block,rpcIo);
       const liveRow=store.db.prepare('SELECT * FROM pools WHERE token=?').get(row.token)||row;
-      await (io.collectBuckets||collectBuckets)(store,liveRow,pool,block,rates,rpcIo);
+      const folded=await (io.collectBuckets||collectBuckets)(store,liveRow,pool,block,rates,rpcIo);
       const fresh=store.db.prepare('SELECT * FROM pools WHERE token=?').get(row.token)||row;
       const grad=graduationTs(fresh);
-      const lastComplete=Math.floor(Number(block.timestamp)/60)*60-60;
+      // Judge only minutes this pool's logs fully cover. A later minute is not missing, just not
+      // collected yet; judging it early wiped the setup and the minute was never looked at again.
+      const chainMinute=Math.floor(Number(block.timestamp)/60)*60-60;
+      const lastComplete=folded?.lastFull!=null?Math.min(chainMinute,folded.lastFull):chainMinute;
       const buckets=loadBuckets(store,row.token,lastComplete-8*3600,lastComplete+60);
       for(const strat of ['A','B','C']) {
         const acc=accounts[strat];
@@ -208,7 +211,8 @@ export async function cycle(store,now=Date.now(),io={}) {
             acc.reject_counts[ev.reason]=(acc.reject_counts[ev.reason]||0)+1;
             if(String(ev.reason).startsWith('WARMUP')) warmup[strat]++;
           }
-          const shouldEnter=ev.signal&&!ending&&evalMinute===lastComplete&&!acc.pending_signals[row.token];
+          // Same 3-minute life as a pending signal, now that the judged minute can trail the chain.
+          const shouldEnter=ev.signal&&!ending&&evalMinute===lastComplete&&now<(evalMinute+180)*1000&&!acc.pending_signals[row.token];
           if(shouldEnter) acc.pending_signals[row.token]={signal:ev.signal,expires_at:(ev.signal.minute+180)*1000};
           // Commit both the minute cursor and pending intent before network I/O.
           writeAccount(store,acc);

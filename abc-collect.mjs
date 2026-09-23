@@ -821,7 +821,7 @@ export async function foldStoredEvents(store,row,pool,block,rates,io={}) {
     ORDER BY s.minute`).all(token,retrySince,lastFull);
   const lateRetrySet=new Set(retryRows.map(r=>Number(r.minute)));
   const workMinutes=[...new Set([...closable,...lateRetrySet])].sort((a,b)=>a-b);
-  if(!workMinutes.length) return {minutes:store.db.prepare('SELECT count(*) c FROM buckets WHERE token=? AND IFNULL(invalid,0)=0').get(token).c,closed:[]};
+  if(!workMinutes.length) return {minutes:store.db.prepare('SELECT count(*) c FROM buckets WHERE token=? AND IFNULL(invalid,0)=0').get(token).c,closed:[],lastFull};
   const infra=io.infra||await infraSet(pool.curve||row.curve,block.number);
   let lastPrice=null,lastSqrt=null;
   const prev=store.db.prepare('SELECT close_usd,close_sqrt FROM buckets WHERE token=? AND close_usd IS NOT NULL AND IFNULL(invalid,0)=0 AND IFNULL(usd_usable,0)=1 ORDER BY minute DESC LIMIT 1').get(token);
@@ -917,7 +917,7 @@ export async function foldStoredEvents(store,row,pool,block,rates,io={}) {
     }
     store.db.exec('COMMIT');
   } catch(e) {store.db.exec('ROLLBACK');throw e;}
-  return {minutes:store.db.prepare('SELECT count(*) c FROM buckets WHERE token=? AND IFNULL(invalid,0)=0').get(token).c,closed};
+  return {minutes:store.db.prepare('SELECT count(*) c FROM buckets WHERE token=? AND IFNULL(invalid,0)=0').get(token).c,closed,lastFull};
 }
 
 export function plannedRoundTripFromQuotes(buy,sell,pool,principalUsd,qty,rates,gasPrice,haircutBps=HAIRCUT_BPS) {
