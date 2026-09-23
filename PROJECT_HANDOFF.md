@@ -14,13 +14,8 @@
 - 处理：`shared/.env.rpc` 里把 `ROBINHOOD_RPC_URL=` 注释掉（值留在注释里，去掉 `#` 即恢复）。读请求改走公共节点默认 URL，失败再退 QuickNode；10 区块 Alchemy 日志兜底随之关闭。公共节点实测 250–300ms，支持 eth_simulateV1。官方文档称公共节点"限流、不建议生产用"，未公布额度。代价：读和日志共用公共节点的同一个串行队列。
 - `e0c1565`：观察中的池落后超过 36000 块（约 1 小时）会重新跳到最新，跳过段记 `LIVE_SUBSCRIBE_SKIP_BACKLOG` 缺口，不补数据。部署后两个座位首轮追平。
 - `8c627cf`：worker 运行中若事件循环清空（Node 以 0 退出，`Restart=on-failure` 不拉起），改为打印 `WORKER_STALLED` 并 exit 1，由 systemd 15 秒内重启。起因：09-22 19:40:07 UTC worker 在一轮开始后 6 秒以状态 0 退出，无信号、无 stop.json、无日志，停了 9 小时。
-- **该退出的根因已查明，并在 VPS 的 Node 22.23.1 上复现**：Node 内置 fetch 的缺陷——abort 恰好落在 gzip 响应体刚收完时，`response.arrayBuffer()` 永不结束且不占任何句柄（VPS 上 300 次试验 14 次挂死，未压缩 0 次）；公共节点对所有响应都回 `content-encoding: gzip`。`scopedFetch` 按域名串行排队，这个挂起请求让同域名的后续请求永远排队；排队中的请求又不响应 viem 的超时（viem 2.56.3 `withTimeout({signal:true})` 只 abort、自己不 reject），于是下一轮首个读请求在 6 秒（readTransport 超时）后事件循环清空，进程退出 0。读和日志共用公共节点队列后才暴露。**修复方案（未部署，待用户批准）**：`scopedFetch` 在 abort 时立即让出队列（`Promise.race`）。离线端到端复现：修复前 20 次内必死、退出点恰为循环开始后 6.003 秒；修复后 40/40 存活。
-- **全面扫描其他已核实问题（均未修，待用户逐个批准）**，按影响排序：
-  1. 评估跑在采集前面：09-14..09-20 有 10–24% 的实时分钟在数据未收齐时被判为缺失（`COVERAGE_NOT_CLOSED`），形态状态被清空且之后不补判；健康时（09-23）为 0%。方向：只判定该池已收齐的分钟。`abc-repair-verify.mjs` 约 725–743 行断言了现有行为，改时要同步。
-  2. 缺口后沿用缺口前价格并标为可用：09-23 重跳后 `0x6321652A` 的无成交分钟沿用 44 小时前的价格（`usd_usable=1`），等同补造数据。方向：跨已声明缺口不沿用价格。
-  3. 一轮之内（30–45 秒）不检查退出，"每 15 秒"只在轮与轮之间成立。价格路径复盘：最大几次超额止损主要是一秒内闪崩，但 C 09-13 那笔穿止损后 36 秒才卖。**更正此前说法**：退出修复后超额并未稳定在 1–4 个点，之后 A 两笔 8.6/8.9 点、C 一笔 10.3 点。
-  4. 三个价格源任一失败（多为 CoinGecko 429）整轮失败，所有持仓当分钟不标价、不止损，包括只用 ETH 计价的池。
-  5. 潜在：卖出模拟用的钱包名单固定在入场时，砸盘后可能都不够余额 → 仓位无法估值、止损不触发、账户永久停止入场。尚未发生。
+- **该退出的根因已查明，并在 VPS 的 Node 22.23.1 上复现**：Node 内置 fetch 的缺陷——abort 恰好落在 gzip 响应体刚收完时，`response.arrayBuffer()` 永不结束且不占任何句柄（VPS 上 300 次试验 14 次挂死，未压缩 0 次）；公共节点对所有响应都回 `content-encoding: gzip`。`scopedFetch` 按域名串行排队，这个挂起请求让同域名的后续请求永远排队；排队中的请求又不响应 viem 的超时（viem 2.56.3 `withTimeout({signal:true})` 只 abort、自己不 reject），于是下一轮首个读请求在 6 秒（readTransport 超时）后事件循环清空，进程退出 0。读和日志共用公共节点队列后才暴露。**已修复并部署 `4205d54`**：`scopedFetch` 的响应体读取和返回给调用方的 promise 都与 abort 赛跑（`untilAbort`），队列仍按域名一次一个。用真实 chain.mjs + 本地 gzip RPC 验证：修复前 8 次超时后队列死亡、下一轮开始 6.008 秒后进程退出 0；修复后 VPS 同版本 Node 上两次各 60 次超时，Node 的挂起分别发生 5 次和 8 次，队列始终存活；排队中被取消的请求按时（500ms）返回而非晚 2.8 秒，下一个请求仍等前一个结束。
+- **全面扫描发现的其余 5 个问题（均未修，用户要求先记下）**：清单、修法方向和代码位置见仓库根目录 `TODO.md`，修完一条就在那里打勾。按建议顺序：数据没收齐就判分钟；缺口后沿用旧价格；一轮之内不查止损；一个价格源失败整轮作废；砸盘后仓位可能无法估值（潜在）。**更正此前说法**：退出修复后超额并未稳定在 1–4 个点，之后 A 两笔 8.6/8.9 点、C 一笔 10.3 点。
   - 已核对无问题：成本闸与账本首次标价差 0.03–0.87 个点（12 笔买入，中位约 0.24），可忽略；账本算术、重复买卖、前视偏差未发现问题。
   - 次要：换座位时会补判离开期间的全部分钟（`evaluated_minutes` 无上限），污染筛选统计；已暂停的 C 仍占持有人预热轮转。
 
@@ -29,10 +24,10 @@
 
 ### 代码与生产位置
 
-- 本地：`<LOCAL_REPO>`，main HEAD 为本文档提交（其前 `8c627cf`、`e0c1565`）。**这三个提交待在 Mac 上 `git push origin main`**（本 session 环境无 GitHub 凭据）。
+- 本地：`<LOCAL_REPO>`，main HEAD 为本文档提交（其前 `4205d54`、`cc892b2`、`8c627cf`、`e0c1565`）。**`98efe57` 之后的提交都待在 Mac 上 `git push origin main`**（本 session 环境无 GitHub 凭据）。
 - SSH：`<VPS_USER>@<VPS_HOST>`，会话密钥（`authorized_keys` 注释 `cowork-session`）常驻。
-- VPS：`current -> releases/8c627cf`，PID `1724866`（须重新核实），systemd 托管。`releases/392da39` **持有唯一真实 node_modules，勿删**（详见下文清理章节）。
-- 发布前快照：`shared/deployment-{...,aae5c26,65aed59,df34290,d9fb80c,e0c1565,8c627cf}-before.json`；延长实验前快照：`shared/experiment-extend-before.json`。
+- VPS：`current -> releases/4205d54`，PID `1729626`（须重新核实），systemd 托管。`releases/392da39` **持有唯一真实 node_modules，勿删**（详见下文清理章节）。
+- 发布前快照：`shared/deployment-{...,aae5c26,65aed59,df34290,d9fb80c,e0c1565,8c627cf,4205d54}-before.json`；延长实验前快照：`shared/experiment-extend-before.json`。
 
 ### 8 个回合的结果与最重要的发现
 
