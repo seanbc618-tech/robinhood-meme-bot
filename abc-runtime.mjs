@@ -169,13 +169,15 @@ export async function cycle(store,now=Date.now(),io={}) {
   let lastExitCheck=Date.now();
   const exitCheck=async()=>{
     if(Date.now()-lastExitCheck<EXIT_TICK_MS||!['A','B','C'].some(s=>accounts[s].positions.length)) return;
-    lastExitCheck=Date.now();
     try {
-      const tick=await exitOnlyTick(store,lastExitCheck,io);
+      const tick=await exitOnlyTick(store,Date.now(),io);
       if(tick.checked) {const r=readRun(store);r.exit_ticks=(r.exit_ticks||0)+1;r.last_exit_tick_at=Date.now();writeRun(store,r);}
     } catch(error) {
       const r=readRun(store);r.last_exit_tick_error={error:failure(error),kind:classifyError(error),at:Date.now()};writeRun(store,r);
     }
+    // Space checks from the end of the last one: each re-quotes every holding on the shared RPC
+    // queue, so a slow check must not run again right away and crowd out collection.
+    lastExitCheck=Date.now();
     // The tick wrote the accounts; later steps must not write back stale copies over its exits.
     for(const s of ['A','B','C']) accounts[s]=readAccount(store,s);
   };
