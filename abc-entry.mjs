@@ -19,6 +19,7 @@ export async function markAndExit(store,account,block,rates,gasPrice,now,io={}) 
     try {
       const pool=await getPool(p.token,block.number);
       const marked=await quoteNet(pool,p.qty,block,rates,gasPrice,HAIRCUT_BPS,p.exit_candidates||[]);
+      if(marked.candidates) p.exit_candidates=marked.candidates;
       p.mark=marked.mark;p.mark_raw=marked.net;p.mark_block=String(block.number);p.exit_incomplete=false;
       const multiple=pnlMultiple(p,marked.mark);
       if(multiple!=null&&multiple>(p.peak_multiple||0)) p.peak_multiple=multiple;

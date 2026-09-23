@@ -949,11 +949,22 @@ export async function plannedRoundTrip(pool,principalUsd,block,rates,gasPrice,ha
 export async function netExitValue(pool,qty,block,rates,gasPrice,haircutBps=HAIRCUT_BPS,candidates=[]) {
   qty=BigInt(qty);
   if(qty<=0n) return {net:0,mark:0,usd:0,gas:0,quote:null,uneconomic:false};
-  if(!candidates.length) candidates=(await holderData(pool,block.number)).summary.top10.map(h=>h.address);
-  const q=await simulateExit(pool,qty,block,gasPrice,candidates);
+  const current=async()=>(await holderData(pool,block.number)).summary.top10.map(h=>h.address);
+  const fresh=!candidates.length;
+  if(fresh) candidates=await current();
+  let q;
+  try {q=await simulateExit(pool,qty,block,gasPrice,candidates);}
+  catch(error) {
+    // The holders saved at entry can all sell below our size, which is what a dump looks like,
+    // and a position no one can be simulated selling is never marked, stopped or closed. Retry
+    // once with today's top holders; the caller keeps them for the next mark.
+    if(fresh||!/EXIT_SIMULATION_HOLDER_UNAVAILABLE/.test(failure(error))) throw error;
+    candidates=await current();
+    q=await simulateExit(pool,qty,block,gasPrice,candidates);
+  }
   const usd=Number(formatUnits(haircutQty(q.amountOut,haircutBps),pool.quoteDecimals))*quoteUsd(pool,rates);
   const gas=modeledGasUsd(q,gasPrice,rates),net=usd-gas;
-  return {usd,gas,net,mark:Math.max(0,net),quote:q,uneconomic:net<0};
+  return {usd,gas,net,mark:Math.max(0,net),quote:q,uneconomic:net<0,candidates};
 }
 
 export async function safetyScreen(store,pool,block,rates) {
