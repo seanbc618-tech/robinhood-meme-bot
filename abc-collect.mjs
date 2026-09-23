@@ -973,25 +973,27 @@ export async function plannedRoundTrip(pool,principalUsd,block,rates,gasPrice,ha
     l1GasUsd:Number(formatUnits(simulation.fees.buyL1Wei+simulation.fees.sellL1Wei,18))*rates.prices.ethereum.usd};
 }
 
-export async function netExitValue(pool,qty,block,rates,gasPrice,haircutBps=HAIRCUT_BPS,candidates=[]) {
+export async function netExitValue(pool,qty,block,rates,gasPrice,haircutBps=HAIRCUT_BPS,candidates=[],refresh=true) {
   qty=BigInt(qty);
   if(qty<=0n) return {net:0,mark:0,usd:0,gas:0,quote:null,uneconomic:false};
-  const current=async()=>(await holderData(pool,block.number)).summary.top10.map(h=>h.address);
-  const fresh=!candidates.length;
-  if(fresh) candidates=await current();
+  let fetched=false;
+  const current=async()=>{fetched=true;return (await holderData(pool,block.number)).summary.top10.map(h=>h.address);};
   let q;
-  try {q=await simulateExit(pool,qty,block,gasPrice,candidates);}
-  catch(error) {
-    // The holders saved at entry can all sell below our size, which is what a dump looks like,
-    // and a position no one can be simulated selling is never marked, stopped or closed. Retry
-    // once with today's top holders; the caller keeps them for the next mark.
-    if(fresh||!/EXIT_SIMULATION_HOLDER_UNAVAILABLE/.test(failure(error))) throw error;
-    candidates=await current();
-    q=await simulateExit(pool,qty,block,gasPrice,candidates);
-  }
+  try {
+    if(!candidates.length&&refresh) candidates=await current();
+    try {q=await simulateExit(pool,qty,block,gasPrice,candidates);}
+    catch(error) {
+      // The holders saved at entry can all sell below our size, which is what a dump looks like,
+      // and a position no one can be simulated selling is never marked, stopped or closed. Retry
+      // once with today's top holders; the caller keeps them and decides when to refresh again.
+      if(fetched||!refresh||!/EXIT_SIMULATION_HOLDER_UNAVAILABLE/.test(failure(error))) throw error;
+      candidates=await current();
+      q=await simulateExit(pool,qty,block,gasPrice,candidates);
+    }
+  } catch(error) {if(fetched) error.candidates=candidates;throw error;}
   const usd=Number(formatUnits(haircutQty(q.amountOut,haircutBps),pool.quoteDecimals))*quoteUsd(pool,rates);
   const gas=modeledGasUsd(q,gasPrice,rates),net=usd-gas;
-  return {usd,gas,net,mark:Math.max(0,net),quote:q,uneconomic:net<0,candidates};
+  return {usd,gas,net,mark:Math.max(0,net),quote:q,uneconomic:net<0,candidates:fetched?candidates:undefined};
 }
 
 export async function safetyScreen(store,pool,block,rates) {

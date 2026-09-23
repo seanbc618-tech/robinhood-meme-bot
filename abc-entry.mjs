@@ -18,8 +18,13 @@ export async function markAndExit(store,account,block,rates,gasPrice,now,io={}) 
   for(const p of account.positions) {
     try {
       const pool=await getPool(p.token,block.number);
-      const marked=await quoteNet(pool,p.qty,block,rates,gasPrice,HAIRCUT_BPS,p.exit_candidates||[]);
-      if(marked.candidates) p.exit_candidates=marked.candidates;
+      // Refetch exit holders at most every 10 minutes. When no current holder can cover us either,
+      // each 15 s mark would otherwise rescan the holder history on the shared RPC queue.
+      const refresh=!(clock()-(p.exit_candidates_at||0)<600000);
+      let marked;
+      try {marked=await quoteNet(pool,p.qty,block,rates,gasPrice,HAIRCUT_BPS,p.exit_candidates||[],refresh);}
+      catch(error) {if(error.candidates) {p.exit_candidates=error.candidates;p.exit_candidates_at=clock();} throw error;}
+      if(marked.candidates) {p.exit_candidates=marked.candidates;p.exit_candidates_at=clock();}
       p.mark=marked.mark;p.mark_raw=marked.net;p.mark_block=String(block.number);p.exit_incomplete=false;
       const multiple=pnlMultiple(p,marked.mark);
       if(multiple!=null&&multiple>(p.peak_multiple||0)) p.peak_multiple=multiple;
