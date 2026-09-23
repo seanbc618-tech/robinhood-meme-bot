@@ -69,19 +69,24 @@ export function stablecoinProblem(rates,now=Date.now()/1000) {
 export function usdSourceAge(rates,now=Date.now()/1000) {
   return now-rates.prices.ethereum.last_updated_at;
 }
+// Gates a cycle or exit tick: marks and stops need the block and ETH, not the stablecoins.
 export function assertFreshness(block,rates,now=Date.now()/1000) {
   requireValue(Math.abs(now-Number(block.timestamp))<=STALE_SEC,'SOURCE_STALE');
   requireValue(Math.abs(now-rates.observed_at)<=STALE_SEC,'USD_OBSERVED_STALE');
   requireValue(rates.prices.ethereum&&Number.isFinite(rates.prices.ethereum.usd)&&rates.prices.ethereum.usd>0,'USD_SOURCE_MISSING');
-  const stable=stablecoinProblem(rates,now);
-  if(stable) requireValue(false,stable);
 }
-export function assertTradeFresh(block,rates,nowMs=Date.now()) {
+// Rates for marking and exits. While any stablecoin is missing, stale or off peg, USDG-quoted
+// pools are left unpriced (as when the whole cycle used to fail) and ETH pools keep their stops.
+export function markingRates(rates,now=Date.now()/1000) {
+  return stablecoinProblem(rates,now)?{...rates,prices:{...rates.prices,'global-dollar':null}}:rates;
+}
+// Entries check the stablecoins too; exits pass stable=false and rely on markingRates instead.
+export function assertTradeFresh(block,rates,nowMs=Date.now(),stable=true) {
   const now=nowMs/1000;
   if(Math.abs(now-Number(block.timestamp))>STALE_SEC) return 'BLOCK_STALE';
   if(Math.abs(now-rates.observed_at)>STALE_SEC) return 'USD_OBSERVED_STALE';
   if(usdSourceAge(rates,now)>STALE_SEC) return 'USD_SOURCE_STALE';
-  return stablecoinProblem(rates,now);
+  return stable?stablecoinProblem(rates,now):null;
 }
 
 export function quoteFresh(blockTs,rateTs,now,limit=STALE_SEC) {
@@ -291,11 +296,12 @@ export function fxContemporaneous(minute,rates,quote) {
 export function saveFxSnap(store,rates) {
   if(!rates||!rates.prices) return;
   const p=rates.prices;
+  // A stablecoin can be null now (failed quote); SQLite takes null but not undefined.
   const row={
     observed_at:rates.observed_at,
-    eth_usd:p.ethereum?.usd,usdg_usd:p['global-dollar']?.usd,tether_usd:p.tether?.usd,
-    eth_last_updated:p.ethereum?.last_updated_at,usdg_last_updated:p['global-dollar']?.last_updated_at,
-    tether_last_updated:p.tether?.last_updated_at,
+    eth_usd:p.ethereum?.usd??null,usdg_usd:p['global-dollar']?.usd??null,tether_usd:p.tether?.usd??null,
+    eth_last_updated:p.ethereum?.last_updated_at??null,usdg_last_updated:p['global-dollar']?.last_updated_at??null,
+    tether_last_updated:p.tether?.last_updated_at??null,
   };
   const ins=store.db.prepare(`INSERT OR IGNORE INTO fx_observations(minute,observed_at,eth_usd,usdg_usd,tether_usd,eth_last_updated,usdg_last_updated,tether_last_updated)
     VALUES(?,?,?,?,?,?,?,?)`);

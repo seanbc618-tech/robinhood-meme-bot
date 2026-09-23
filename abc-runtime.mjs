@@ -5,7 +5,7 @@ import {broadcast,enabled} from './telegram.mjs';
 import {
   abcDir,openAbc,initAccounts,readAccount,writeAccount,readRun,writeRun,
   syncCatalog,graduationTs,loadBuckets,probePoolActivity,
-  enrichPool,collectBuckets,catalogStats,assertFreshness,
+  enrichPool,collectBuckets,catalogStats,assertFreshness,markingRates,
   ANALYZE_LIMIT,CYCLE_TARGET_MS,DEFAULT_HOURS,STRATEGY_VERSION,
   classifyError,blockContext,usdRates,stringify,usdSourceAge,STALE_SEC,
   markV1BucketsInvalid,CODE_VERSION,COLLECT_BUDGET_MS,
@@ -108,7 +108,7 @@ export async function exitOnlyTick(store,now=Date.now(),io={}) {
   const accounts=['A','B','C'].map(s=>readAccount(store,s)).filter(a=>a.positions.length>0);
   if(!accounts.length) return {checked:0};
   const block=await (io.blockContext||blockContext)();
-  const rates=await (io.usdRates||usdRates)();
+  const rates=markingRates(await (io.usdRates||usdRates)(),now/1000);
   assertFreshness(block,rates,now/1000);
   const gasPrice=io.gasPrice!=null?io.gasPrice:await client.getGasPrice();
   for(const account of accounts) await markAndExit(store,account,block,rates,gasPrice,now,io);
@@ -132,12 +132,15 @@ export async function cycle(store,now=Date.now(),io={}) {
   const block=await (io.blockContext||blockContext)();
   const rates=await (io.usdRates||usdRates)();
   assertFreshness(block,rates,now/1000);
-  saveFxSnap(store,rates);
+  // Entries keep the full rates so a stablecoin problem is reported by name; marks, exits and the
+  // FX record use markingRates, which leaves USDG unpriced while any stablecoin is in doubt.
+  const markRates=markingRates(rates,now/1000);
+  saveFxSnap(store,markRates);
   const gasPrice=io.gasPrice!=null?io.gasPrice:await client.getGasPrice();
   const accounts={};
   for(const s of ['A','B','C']) accounts[s]=readAccount(store,s);
   const held=[...new Set(['A','B','C'].flatMap(k=>accounts[k].positions.map(p=>p.token)))];
-  for(const s of ['A','B','C']) accounts[s]=await markAndExit(store,accounts[s],block,rates,gasPrice,now,io);
+  for(const s of ['A','B','C']) accounts[s]=await markAndExit(store,accounts[s],block,markRates,gasPrice,now,io);
   run.exits_ms=Date.now()-t0;
   const collectDeadline=io.deadline|| (t0+(io.collectBudgetMs??COLLECT_BUDGET_MS));
   Object.assign(run,readRun(store),{status:run.status,last_started_at:run.last_started_at,code_version:CODE_VERSION,exits_ms:run.exits_ms});

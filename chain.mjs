@@ -448,7 +448,6 @@ const COINBASE_TICKER='https://api.exchange.coinbase.com/products';
 const COINGECKO_PRICE='https://api.coingecko.com/api/v3/simple/price?ids=global-dollar&vs_currencies=usd&include_last_updated_at=true';
 // USDG has no seconds-fresh venue: it is not on Coinbase and Kraken's ticker carries no
 // timestamp, so it stays on CoinGecko and is judged by its peg rather than its clock.
-const STABLE_SOURCE_MAX_AGE_SEC=900;
 async function curlJson(url) {
   // Use installed curl for macOS proxy/CA support; no TLS bypass or silent retry.
   const {stdout}=await promisify(execFile)('curl',['--fail','--silent','--show-error','--max-time','20',
@@ -463,24 +462,27 @@ async function coinbaseSpot(product) {
   return {usd,last_updated_at:at};
 }
 export async function usdRates() {
-  const [ethereum,tether,gecko]=await Promise.all([
+  // Only ETH is required. A failed stablecoin quote (usually a CoinGecko 429) used to fail the
+  // whole cycle, so no position was marked or stopped. It is now left null: stablecoinProblem
+  // still blocks every entry and USDG pricing on it, but ETH pools keep their stops.
+  const [eth,usdt,gecko]=await Promise.allSettled([
     coinbaseSpot('ETH-USD'),coinbaseSpot('USDT-USD'),curlJson(COINGECKO_PRICE),
   ]);
-  const usdg=gecko['global-dollar'];
-  requireValue(usdg&&Number.isFinite(usdg.usd)&&usdg.usd>0,'USD_SOURCE_MISSING');
-  const prices={ethereum,tether,'global-dollar':{usd:usdg.usd,last_updated_at:usdg.last_updated_at}};
+  if(eth.status==='rejected') throw eth.reason;
+  const usdg=gecko.status==='fulfilled'?gecko.value?.['global-dollar']:null;
+  const prices={ethereum:eth.value,tether:usdt.status==='fulfilled'?usdt.value:null,
+    'global-dollar':usdg&&Number.isFinite(usdg.usd)&&usdg.usd>0?{usd:usdg.usd,last_updated_at:usdg.last_updated_at}:null};
   const now=Date.now()/1000;
   requireValue(Math.abs(now-prices.ethereum.last_updated_at)<=300,'USD_SOURCE_STALE');
-  for(const key of ['tether','global-dollar']) {
-    requireValue(Math.abs(now-prices[key].last_updated_at)<=STABLE_SOURCE_MAX_AGE_SEC,'USD_SOURCE_STALE');
-  }
   const result={source:`${COINBASE_TICKER}/{ETH-USD,USDT-USD}/ticker + coingecko:global-dollar`,
     observed_at:Math.floor(Date.now()/1000),prices};
   save(resolve(ROOT,'data/rates',`${result.observed_at}.json`),result);
   return result;
 }
 export function quoteUsd(pool,rates) {
-  return rates.prices[pool.quote===zeroAddress?'ethereum':'global-dollar'].usd;
+  const price=rates.prices[pool.quote===zeroAddress?'ethereum':'global-dollar'];
+  requireValue(price&&price.usd>0,'USD_SOURCE_MISSING');
+  return price.usd;
 }
 export async function blockAtTime(timestamp, head) {
   let low=head.number>20000n?head.number-20000n:0n, high=head.number;

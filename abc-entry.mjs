@@ -51,7 +51,7 @@ export async function markAndExit(store,account,block,rates,gasPrice,now,io={}) 
       }
       if(qty===0n) continue;
       const commitAt=clock();
-      const stale=assertTradeFresh(block,rates,commitAt);
+      const stale=assertTradeFresh(block,rates,commitAt,false);
       if(stale) {p.exit_incomplete=true;count(account,stale);writeAccount(store,account);continue;}
       const fill=await quoteNet(pool,qty,block,rates,gasPrice,HAIRCUT_BPS,p.exit_candidates||[]);
       if(fill.uneconomic||fill.net<0) {
