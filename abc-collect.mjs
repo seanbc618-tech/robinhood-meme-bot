@@ -24,6 +24,9 @@ export const WATCH_MAX_MS=36*3600*1000;
 export const WATCH_WINDOW_MINUTES=120;
 export const LIVE_MAX_LAG=2000n;
 export const LIVE_LOOKBACK=900n;
+// A watched pool this far behind (~1h, e.g. after an RPC outage) jumps to live again. Replaying
+// the backlog cannot produce a signal: each minute is judged once, as it closes.
+export const LIVE_REJUMP_LAG=36000n;
 export const HAIRCUT_BPS=0n;
 export const LOG_CHUNK=300n;
 export const MAX_LOG_BLOCKS_PER_POOL=900n;
@@ -1001,7 +1004,7 @@ export async function skipBacklogForLive(store,row,block,io={}) {
   });
   const cur=BigInt(row.last_event_block!=null?row.last_event_block:row.last_cursor_block||0);
   const lag=block.number-cur;
-  if(row.live_from_block!=null) return {jumped:false,lag:String(lag),already_live:true};
+  if(row.live_from_block!=null&&lag<=LIVE_REJUMP_LAG) return {jumped:false,lag:String(lag),already_live:true};
   if(lag<=LIVE_MAX_LAG) return {jumped:false,lag:String(lag)};
   const jumpTo=block.number>LIVE_LOOKBACK?block.number-LIVE_LOOKBACK:0n;
   if(jumpTo<=cur) return {jumped:false,lag:String(lag)};
