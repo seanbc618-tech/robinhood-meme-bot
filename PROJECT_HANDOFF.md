@@ -4,7 +4,16 @@
 > （`<VPS_USER>`、`<VPS_HOST>`、`<VPS_ROOT>`、`<VPS_HOME>`、`<LOCAL_REPO>`）。
 > 完整版保留在本地 `PROJECT_HANDOFF.private.md`，不进入 Git。
 
-## 最新接手入口（2026-09-23 更新，优先于下方历史记录）
+## 最新接手入口（2026-09-24 更新，优先于下方历史记录）
+
+### 2026-09-24：内存泄漏已修（`d548276`）
+
+- **现象**：`releases/3467e8b` 跑了 20 小时，worker RSS 3.3 GB，每小时涨一百多 MB（Node 堆上限 4.3 GB）。09-23 之前的进程连跑 4 天都没有这样。
+- **原因**：`4205d54` 为防"联网排队卡死"加的 `untilAbort` 在请求结束后没有移除 abort 监听。Node 会让挂着监听的组合 AbortSignal 一直存活，监听背后的 race 又抓着回复，于是几乎每个 RPC 回复都留在内存里。
+- **修法与验证**：请求结束即移除监听（`chain.mjs` `untilAbort`）。VPS 同版本 Node 下，同一传输层 100 次 200 KB 回复：旧 release GC 后留 20 MB，新 release 留 0；三套校验全过。
+- **部署**：09-24 16:38 CST，`current -> releases/d548276`，快照 `shared/deployment-d548276-before.json`，账户与实验字段逐项未变。换版前旧进程 RSS 3241 MB；新进程 5 分钟时 142 MB，10 分钟时 144 MB，在 120–145 MB 之间来回、未见上涨。
+- **停机那一轮记为失败（`failed_rounds` 77→78）**：systemd 停服务时把 SIGTERM 发给整个 cgroup，旧 worker 最后一轮里正在取 ETH 价格的 curl 被一起杀掉（stderr 为空），这轮记失败并发了 Telegram 提醒，与新代码无关。以后每次部署都可能这样。
+- **09-23 19:59 至 09-24 16:38 CST 的运行**：共 1216 轮、每分钟一轮，0 失败 0 重启；4 个座位数据完整，汇率每分钟都有，稳定币无异常。17 个信号：C 6 个（已暂停）；HADES 10 个（A 7、B 3）全被 5% 成本闸挡住（来回约 6.1%）；A 买入 BLISS 1 笔：20 分钟 +80% 后追进，买后数秒被砸约 575 美元，轮内止损 6 秒后发现，-13.8% 卖出（止损线 -12%，其中约 4.2% 是来回手续费和滑点）。三账户合计 -36.41。
 
 ### 2026-09-23：Alchemy 月额度耗尽、读请求改走公共节点、两个修复、一次全面扫描
 
@@ -24,10 +33,10 @@
 
 ### 代码与生产位置
 
-- 本地：`<LOCAL_REPO>`，main HEAD 为本文档提交（其前 `3467e8b` 等 9 个修复提交）。**`d0a0329` 之后的提交待在 Mac 上 `git push origin main`**（本 session 环境无 GitHub 凭据）。
+- 本地：`<LOCAL_REPO>`，main HEAD 为本文档提交（其前 `d548276`）。**`d85ac4c` 之后的提交待在 Mac 上 `git push origin main`**（本 session 环境无 GitHub 凭据）。
 - SSH：`<VPS_USER>@<VPS_HOST>`，会话密钥（`authorized_keys` 注释 `cowork-session`）常驻。
-- VPS：`current -> releases/3467e8b`，PID `1734578`（须重新核实），systemd 托管。`releases/392da39` **持有唯一真实 node_modules，勿删**（详见下文清理章节）。
-- 发布前快照：`shared/deployment-{...,aae5c26,65aed59,df34290,d9fb80c,e0c1565,8c627cf,4205d54,3467e8b}-before.json`；延长实验前快照：`shared/experiment-extend-before.json`。
+- VPS：`current -> releases/d548276`，PID `1765509`（须重新核实），systemd 托管。`releases/392da39` **持有唯一真实 node_modules，勿删**（详见下文清理章节）。
+- 发布前快照：`shared/deployment-{...,aae5c26,65aed59,df34290,d9fb80c,e0c1565,8c627cf,4205d54,3467e8b,d548276}-before.json`；延长实验前快照：`shared/experiment-extend-before.json`。
 
 ### 8 个回合的结果与最重要的发现
 
