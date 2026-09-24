@@ -49,12 +49,18 @@ const rpcQueues=new Map();
 // Settle on abort even if p never does. Node's fetch can leave a gzip body read pending forever
 // when the abort lands just as the body completes, and a queued request only saw its abort once
 // dequeued; together they wedged the origin queue and the worker exited 0 (2026-09-22).
+// Remove the listener once p settles. Node keeps a composite signal alive while it has an abort
+// listener, and the race behind that listener held the reply: every response stayed in memory
+// (3.3 GB after 20 h, 2026-09-24).
 function untilAbort(p,signal) {
   if(!signal) return p;
-  return Promise.race([p,new Promise((_,reject)=>{
+  let onAbort;
+  const aborted=new Promise((_,reject)=>{
+    onAbort=()=>reject(signal.reason);
     if(signal.aborted) reject(signal.reason);
-    else signal.addEventListener('abort',()=>reject(signal.reason),{once:true});
-  })]);
+    else signal.addEventListener('abort',onAbort,{once:true});
+  });
+  return Promise.race([p,aborted]).finally(()=>signal.removeEventListener('abort',onAbort));
 }
 function scopedFetch(url,options={}) {
   const scope=rpcScope.getStore();
