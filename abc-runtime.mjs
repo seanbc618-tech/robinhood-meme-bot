@@ -41,33 +41,57 @@ export function releaseLock(dir) {
 
 function notifySafe(run,key,text) {
   return (async()=>{
-    if(!/^(fill:|halt:|hourly-holdings:)/.test(key)||!enabled()) return {skipped:true};
+    if(!/^(fill:|halt:|daily:)/.test(key)||!enabled()) return {skipped:true};
     try {return await broadcast('abc:'+key,text);}
     catch(e) {run.telegram_error=failure(e);return {error:failure(e)};}
   })();
 }
 
-function accountSummary(a) {
-  const money=v=>v==null?'不可用':Number(v).toFixed(2);
-  return `策略 ${a.strategy}：现金 ${money(a.cash)}，净值 ${money(a.equity)} USD\n已实现 ${money(a.realized)}，浮动 ${money(a.unrealized)}；持仓 ${a.positions.length}，熔断 ${a.halted_permanent?'累计':a.halted_day?'当日':'无'}\n`+
-    (a.positions.length?a.positions.map(p=>`${p.token}：估值 ${money(p.mark)} USD`).join('\n'):'当前空仓');
-}
-
-export async function notifyHourlyHoldings(store,run) {
-  const hour=new Date().toISOString().slice(0,13);
-  if(run.last_holdings_hour===hour) return;
+const EXIT_NAMES={stop:'止损',trail:'回撤止盈',timeout:'超时',partial_tp:'分批止盈',recover:'回本',half:'减半',risk:'风控'};
+const bjTime=ms=>new Date(ms+8*3600000).toISOString();
+export function dailyText(store,run,from,now) {
+  const sym=token=>store.db.prepare('SELECT symbol FROM pools WHERE token=?').get(token)?.symbol||token.slice(0,8);
+  const usd=v=>(v>=0?'+':'')+v.toFixed(2);
   const accs=['A','B','C'].map(s=>readAccount(store,s));
-  const latest=store.db.prepare(`SELECT w.slot,MAX(b.minute) AS minute FROM watch_slots w
-    LEFT JOIN buckets b ON b.token=w.token AND b.invalid=0 AND b.usd_usable=1
-    WHERE w.status='ACTIVE' GROUP BY w.slot ORDER BY w.slot`).all();
-  const lag=latest.map(x=>`槽${x.slot}：${x.minute==null?'无可用行情':`${Math.max(0,Math.floor((Date.now()/1000-x.minute-60)/60))} 分钟`}`).join('；')||'无观察池';
-  const counts=store.db.prepare(`SELECT strategy,COUNT(*) AS n FROM screening_evals WHERE observed_at>=?
-    AND COALESCE(detail_code,'')!='GRADUATION_OVER_6H'
-    AND funnel_stage IN ('NO_STRATEGY_SIGNAL','STRATEGY_SIGNAL','SAFETY_PASS','SAFETY_FAIL','PAPER_FILL') GROUP BY strategy`).all(Date.now()-3600000);
-  const effective=['A','B','C'].map(s=>`${s}:${counts.find(x=>x.strategy===s)?.n||0}`).join('，');
-  const result=await notifySafe(run,`hourly-holdings:${run.started_at}:${hour}`,
-    `📊 ABC 每小时持仓（纸面模拟，非实盘）\n报告时间：${new Date().toISOString()}\n状态：${run.status}\n行情落后：${lag}\n最近60分钟有效评估：${effective}\n最近完成轮：${run.last_completed_at?new Date(run.last_completed_at).toISOString():'尚无'}\n${accs.map(accountSummary).join('\n\n')}`);
-  if(result?.message_id||result?.duplicate) run.last_holdings_hour=hour;
+  const idle=Math.round((now-(run.last_completed_at||0))/60000);
+  const lines=[`📊 ABC 日报 ${bjTime(now).slice(5,10)}（模拟盘，非实盘）`,
+    `统计 ${bjTime(from).slice(5,16).replace('T',' ')} 到 ${bjTime(now).slice(5,16).replace('T',' ')}（北京时间）`,'',
+    `运行：${idle<=3?'正常':`⚠️ 已 ${idle} 分钟没跑完一轮`}，${run.last_daily_failed==null?`累计失败 ${run.failed_rounds||0} 轮`:`期间失败 ${(run.failed_rounds||0)-run.last_daily_failed} 轮`}`,'',
+    '账户（各从 1000 起步）：',
+    ...accs.map(a=>`${a.strategy} ${a.equity==null?'净值不可用':`${a.equity.toFixed(2)}（${usd(a.equity-1000)}）`}${a.paused_reason?'，已暂停买入':''}`)];
+  if(accs.every(a=>a.equity!=null)) lines.push(`合计 ${usd(accs.reduce((sum,a)=>sum+a.equity,0)-3000)}`);
+  const closed=accs.flatMap(a=>(a.closed_rounds||[]).filter(r=>r.closed>=from).map(r=>
+    `${a.strategy} ${sym(r.token)} ${r.pnl>=0?'+':''}${(100*r.pnl/r.cost).toFixed(1)}%（${EXIT_NAMES[r.reason]||r.reason}）`));
+  const held=accs.flatMap(a=>a.positions.map(p=>`${a.strategy} ${sym(p.token)} 买入 ${p.cost.toFixed(2)}，现值 ${p.mark==null?'不可用':p.mark.toFixed(2)}`));
+  lines.push('',`平仓 ${closed.length} 笔`,...closed,`持仓 ${held.length} 个`,...held);
+  const signals=store.db.prepare('SELECT strategy,token,minute,paper_filled,checks_json FROM screening_evals WHERE has_signal=1 AND minute>=? AND minute<?')
+    .all(Math.floor(from/1000),Math.floor(now/1000));
+  const why={};
+  for(const r of signals) {
+    if(r.paper_filled) continue;
+    const a=accs.find(x=>x.strategy===r.strategy);
+    const checks=JSON.parse(r.checks_json||'[]');
+    const fail=checks.find(c=>c.status==='FAIL');
+    const missing=checks.find(c=>c.status==='UNKNOWN'&&!c.diagnose_only&&c.reason!=='ROUND_TRIP_DEFERRED_UNTIL_ENTRY');
+    const k=a.paused_reason?`${r.strategy} 暂停中`
+      :a.trades.some(t=>t.side==='buy'&&t.token===r.token&&t.at<r.minute*1000)?'这个币已经买过'
+      :fail?(fail.reason==='ROUND_TRIP_COST_OVER_GATE'?'手续费+滑点超 5%':fail.reason)
+      :missing?(/^(holder|top10)/.test(missing.name)?'持有人数据没拿到':`数据没拿到（${missing.name}）`)
+      :'其他';
+    why[k]=(why[k]||0)+1;
+  }
+  const bought=signals.filter(r=>r.paper_filled).length;
+  lines.push('',`信号 ${signals.length} 个，买入 ${bought} 个${signals.length>bought?'，没买的原因：':''}`,
+    ...Object.entries(why).sort((x,y)=>y[1]-x[1]).map(([k,n])=>`${k} ×${n}`));
+  return lines.join('\n');
+}
+// One report a day after 09:00 Beijing time, covering everything since the previous one. It replaced
+// the hourly holdings message (2026-09-25); fills and halts still go out as they happen.
+export async function notifyDaily(store,run,now=Date.now()) {
+  const day=bjTime(now).slice(0,10);
+  if(!enabled()||Number(bjTime(now).slice(11,13))<9||run.last_daily_day===day) return;
+  const result=await notifySafe(run,`daily:${day}`,dailyText(store,run,run.last_daily_at||now-86400000,now));
+  if(result?.message_id||result?.duplicate) Object.assign(run,{last_daily_day:day,last_daily_at:now,last_daily_failed:run.failed_rounds||0});
   writeRun(store,run);
 }
 
@@ -431,7 +455,7 @@ export async function worker(hours,foreground=false) {
         if(run.prev_error!==run.last_error) await notifySafe(run,`err:${run.failed_rounds}`,`⚠️ ABC PAPER 本轮失败（非实盘）\n${kind}\n${run.last_error}\n净值置 null，不伪造行情。`);
         run.prev_error=run.last_error;writeRun(store,run);
       }
-      await notifyHourlyHoldings(store,run);
+      await notifyDaily(store,run);
       const next=Math.min(nextTickDeadline(tickStart),run.ends_at);
       const shouldStop=()=>stopping||existsSync(resolve(dir,'stop.json'));
       while(Date.now()<next&&!shouldStop()) {
