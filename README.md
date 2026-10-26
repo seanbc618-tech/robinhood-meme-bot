@@ -1,10 +1,161 @@
+# Robinhood Meme Bot
+
+**On-chain meme-token research and paper trading on Robinhood Chain, with Pons pool discovery, Uniswap V4 simulations, and persistent A/B/C strategy accounts.**
+
+中文：面向 Robinhood Chain 的 Meme 币研究与纸面模拟工具，包含 Pons 池发现、Uniswap V4 买卖模拟、ABC 三策略账户和 Telegram 通知。
+
+> **Paper trading only.** The project does not load private keys, sign transactions, or broadcast orders. RPC simulations and paper fills are not live executions or evidence of profitability.
+>
+> **仅用于纸面研究。** 不读取私钥、不签名、不广播交易；模拟成交不代表实盘成交或已验证盈利。
+
+[Repository](https://github.com/seanbc618-tech/robinhood-meme-bot) · [MIT License](LICENSE) · [中文交接记录](PROJECT_HANDOFF.md) · [任务记录](tasks/)
+
+## Overview / 项目概览
+
+The main entry point is `abc.mjs`. It collects on-chain pool events and minute-level observations, evaluates three strategy rule sets, checks holder/liquidity/cost evidence, and maintains separate simulated accounts in SQLite. It also records why candidates did not qualify, so missing data and rejected signals remain inspectable.
+
+- **Discovery and data collection:** Pons launch/pool events, observation slots, transfer-based holder history, and timestamped price inputs.
+- **Strategy research:** independent A/B/C signal evaluation, paper entries and exits, account valuation, and persistent risk stops.
+- **Execution modeling:** quantity-specific Uniswap V4 quotes and RPC buy/approval/sell simulations, with modeled execution costs and an entry cost gate.
+- **Diagnostics:** screening funnels, rejection reasons, data-gap evidence, and local reports.
+- **Notifications:** optional Telegram reporting. The ABC runtime includes daily summaries and trade/risk notifications; Telegram is not an order-command interface.
+
+中文：主入口为 `abc.mjs`，流程是“采集 → 策略判断 → 安全与成本检查 → 纸面记账 → 报告”。三个策略分别记账，未通过筛选和数据缺口也会留下诊断证据。
+
+The Python scanner/planner, the earlier single-account simulator, and the receipt ledger remain available as separate tools. Their rules and data files should not be confused with the ABC workflow. Historical reports describe particular runs; inspect the relevant runtime data before making claims about current status or performance.
+
+中文：Python 首版、早期单账户模拟器和收据账本仍保留，与 ABC 使用不同入口和数据。历史交付记录不是当前运行状态。
+
+## Getting started / 快速开始
+
+Requires **Node.js 22.13+** (including `node:sqlite`). **Python 3.10+** is only needed for the original `bot.py` tools. Node dependencies are pinned in `package-lock.json`.
+
+```sh
+git clone https://github.com/seanbc618-tech/robinhood-meme-bot.git
+cd robinhood-meme-bot
+npm ci
+```
+
+Optional configuration:
+
+| File | Purpose / 用途 |
+|---|---|
+| `.env.rpc` | RPC endpoints: `ROBINHOOD_RPC_URL`, optional log providers and `ROBINHOOD_TRACE_RPC_URL`. See comments in [`.env.example`](.env.example). / RPC 与可选日志、trace 节点配置。 |
+| `.env.telegram` | Optional `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`; use `.env.example` as a template. / 可选 Telegram 通知凭据。 |
+
+Keep credential files local with permissions `0600`. Both are ignored by Git. Without a custom read endpoint, the code uses its public RPC default; provider limits and available methods can affect collection and simulation. No wallet funding or private key is required for paper research.
+
+中文：按需配置 RPC 和 Telegram，凭据仅保存在本地。纸面模拟不需要钱包入金或私钥；公共节点能力和限流会影响数据采集。
+
+### ABC paper workflow / ABC 纸面模拟
+
+```sh
+# Start a 24-hour paper run in the background / 启动 24 小时后台纸面观察
+node abc.mjs start 24
+
+# Inspect the saved status snapshot / 查看已保存的状态快照
+node abc.mjs status
+
+# Print screening diagnostics through the read-only store / 只读筛选诊断
+node abc.mjs screening-report
+
+# Request a stop after the current cycle / 请求当前轮结束后停止
+node abc.mjs stop
+```
+
+`node abc.mjs run 24` runs the paper worker in the foreground instead of detaching it. `node abc.mjs report` prints an account report, but opens the writable store and initializes accounts if absent; it is not a strictly read-only command.
+
+The default ABC directory is `data/abc/`; `ABC_HOME` selects a separate directory. A fresh run accepts a duration greater than 0 and up to 336 hours (default: 336). Existing run/account state is retained, so restarting does not create a fresh experiment or reset its end time. Do not run duplicate workers against the same store. Starting a process locally does not install a system service.
+
+中文：默认状态在 `data/abc/`，可用 `ABC_HOME` 指定独立目录。重启沿用已有账户及实验截止时间，不会自动清零；同一状态目录只运行一个 worker。`status` 读取的是快照，不能单独证明进程仍在健康采集。
+
+### Other entry points / 其他入口
+
+| Command | Purpose / 用途 |
+|---|---|
+| `node chain.mjs check` | Check chain connectivity and contracts. / 检查链连接与合约。 |
+| `node chain.mjs discover 5` | Analyze recent registered pools; may send a Telegram scan summary when configured. / 分析近期注册池，配置通知后可发送扫描汇总。 |
+| `node chain.mjs analyze TOKEN_ADDRESS` | Inspect one token/pool. / 分析指定代币与池。 |
+| `node chain.mjs quote TOKEN_ADDRESS 0.005` | Request a quantity-specific quote. / 按数量报价。 |
+| `node chain.mjs simulate TOKEN_ADDRESS 0.005` | Simulate a buy/approval/sell sequence through RPC. / RPC 连续买卖模拟。 |
+| `python3 bot.py scan` | Original event scanner, storing events in SQLite. / 首版事件采集。 |
+| `python3 bot.py plan account.example.json` | Calculate a plan from a supplied account snapshot. / 根据账户快照计算草案。 |
+
+For `quote` and `simulate`, the amount is in the pool's quote asset (ETH or USDG), **not USD**. Simulation without an account argument supports ETH; USDG simulation needs a funded public wallet address as the fourth argument. No transaction is signed or broadcast. See the Chinese reference below for the legacy simulator and receipt-ledger commands.
+
+## Project structure / 项目结构
+
+The repository uses small ES modules at the root rather than a separate `src/` tree. Runtime data is generated locally and excluded from Git.
+
+```text
+robinhood-meme-bot/
+├── abc.mjs                    # Main ABC CLI / ABC 主入口
+├── abc-runtime.mjs            # Worker lifecycle, scheduling, reports / 运行调度与报告
+├── abc-collect.mjs            # Collection, SQLite store, quotes/costs / 采集、存储与成本
+├── abc-collect-readonly.mjs   # Read-only ABC store access / 只读数据库入口
+├── abc-strategy.mjs           # A/B/C signal rules / 三策略信号规则
+├── abc-entry.mjs              # Entry checks, valuation and exits / 入场检查、估值与退出
+├── abc-paper.mjs              # Paper account math and risk rules / 纸面账户与风控规则
+├── abc-safety-evidence.mjs    # Holder/liquidity safety evidence / 持有人及流动性检查
+├── abc-screening.mjs          # Screening module exports / 筛选模块统一导出
+├── abc-screening-*.mjs        # Funnel, metrics, persistence, reports and checks / 筛选诊断
+├── chain.mjs                  # RPC, Pons and Uniswap V4 integration / 链上交互与模拟
+├── holder-history.mjs         # Transfer-history holder cache / 持有人历史缓存
+├── telegram.mjs               # Telegram delivery and deduplication / 通知与去重
+├── ledger.mjs                 # Confirmed transaction receipt ledger / 已确认交易收据账本
+├── sim-run.mjs                # Earlier single-account simulation runner / 早期模拟入口
+├── paper.mjs                  # Earlier paper account implementation / 早期纸面账户
+├── bot.py                     # Original Python scanner and planner / 首版扫描与计划器
+├── abc-verify.mjs             # ABC verification script / ABC 校验
+├── abc-repair-verify.mjs      # Repair regression checks / 修复回归校验
+├── abc-reproduce-v1.mjs       # Historical failure reproductions / 历史问题复现
+├── account.example.json      # Python planner input example / 账户输入示例
+├── .env.example               # Configuration template, no credentials / 配置模板
+├── package.json              # Runtime requirement and dependencies / 运行要求与依赖
+├── package-lock.json         # Locked dependency versions / 依赖锁定
+├── PROJECT_HANDOFF.md        # Public handoff and dated operating notes / 公开交接记录
+├── SIMULATION_STATUS.md      # Earlier simulation acceptance snapshot / 早期验收快照
+├── TODO.md                   # Work notes and tracked issues / 工作与问题记录
+├── Robinhood打狗bot-制作指南.md  # Original Chinese design guide / 原始制作指南
+├── tasks/                    # Specifications, reviews and delivery records / 任务及验收记录
+├── LICENSE                   # MIT license / MIT 许可证
+└── data/                     # Generated locally; ignored by Git / 本地运行数据
+    ├── abc/                  # ABC database, status and process log / ABC 状态
+    ├── paper.sqlite          # Earlier paper account / 早期纸面账户
+    ├── ledger.sqlite         # Transaction receipt ledger / 收据账本
+    └── events.sqlite         # Python scanner events / Python 事件库
+```
+
+To follow the main execution path, start with `abc.mjs` → `abc-runtime.mjs`, then read `abc-collect.mjs`, `abc-strategy.mjs`, `abc-entry.mjs`, and `abc-paper.mjs`. Screening modules explain diagnostic outcomes; `chain.mjs` supplies the underlying reads, quotes, and simulations.
+
+中文：理解主流程先读入口和调度，再看采集、策略、入场退出与账户记账；链上细节集中在 `chain.mjs`，筛选证据在 `abc-screening*` 模块。
+
+## Development and data boundaries / 维护与数据边界
+
+Existing verification scripts include `abc-verify.mjs`, `abc-repair-verify.mjs`, and `abc-screening-verify*.mjs`. Review a script's setup and I/O before running it; task-specific acceptance evidence is under `tasks/`.
+
+Commit source and public documentation only. Keep `.env.*` credentials, `data/`, `node_modules/`, and `PROJECT_HANDOFF.private.md` out of Git. Preserve existing account state, observation slots, and frozen experiment records. Source-declared gaps remain `INVALID_DECLARED_GAP` / `null`; do not invent missing prices or fills.
+
+中文：只提交源码与公开说明，保留账户和实验历史。供应商本身不存在的数据按缺口处理，不补造行情或成交。
+
+Licensed under [MIT](LICENSE), copyright (c) 2026 seanbc618-tech. Third-party dependencies retain their own licenses.
+
+## Chinese historical reference / 中文历史参考
+
+The following original notes describe early implementation decisions and dated checks. They are retained for context, **not as current ABC configuration or live deployment status**. For later changes, read [PROJECT_HANDOFF.md](PROJECT_HANDOFF.md) and the relevant [task records](tasks/), then verify the actual code/runtime.
+
+以下保留原中文说明，便于追溯早期规则与验证。旧费用模型、服务部署情况、钱包和节点快照可能已过时，不代表当前 ABC 配置或运行状态。
+
+<details>
+<summary>展开原始中文说明 / Expand original Chinese notes</summary>
+
 > 当前版本：ABC 链上纸面模拟研究工具。模拟成交不代表实盘成交或已验证盈利。历史任务交付报告是当时快照，最新运行状态以本机数据为准。
 >
 > 许可证：[MIT](LICENSE)，Copyright (c) 2026 seanbc618-tech。第三方依赖保留各自许可证。
 >
 > 协作维护：提交源码与任务说明，不提交 `.env.*` 凭据、`data/` 运行数据或 `node_modules/`。接手前阅读 `tasks/` 中最新交付和复验说明；保留账户与观察槽，未经明确授权不启用实盘、不重置资金。
 
-# Robinhood 打狗 Bot
+### Robinhood 打狗 Bot（早期说明）
 
 已完成：Pons 事件观察、热点筛选、V4 双向报价/连续买卖模拟、收据记账与 Telegram 播报。
 **还不是可实盘交易的 bot，没有盈利验证。** 不读取私钥、不发链上交易。
@@ -12,9 +163,9 @@
 Python 首版保持可用；新增功能入口见下节。
 保留原始《制作指南》，本文件记录本轮具体决定和实际完成情况。
 
-## 新增功能与 Telegram
+### 新增功能与 Telegram
 
-## 持续模拟观察
+### 持续模拟观察
 
 ```sh
 node sim-run.mjs start 24
@@ -64,7 +215,7 @@ Telegram 已配置到“情报小分队”。凭据只存 `.env.telegram`，权�
 只扫描最近 10,001 块的注册池，默认分析其中最新 5 个，最大 20 个；不声称覆盖所有热点。
 股票代币等其他报价资产明确标记 `QUOTE_ASSET_NOT_IMPLEMENTED`，不作为已通过候选。
 
-## 成交账本
+### 成交账本
 
 更新：已接入用户提供的 SolidRPC，并验证链 ID 4663 和历史交易 `debug_traceTransaction/callTracer` 返回成功。
 `chain.mjs` 日常读取使用 `ROBINHOOD_RPC_URL`（未配置时仍为公共 RPC）；`ledger.mjs` 的 ETH trace 使用
@@ -94,7 +245,7 @@ node ledger.mjs account WALLET_ADDRESS
 账户对账不完整时新增预算为 0；净损失到 800 的停止状态持久化，重启不解除。
 只支持独立钱包，暂不支持补仓、追加入金、提款对账；没有自动收据订阅或实盘订单执行器。
 
-## 本轮验证（2026-09-05）
+### 本轮验证（2026-09-05）
 
 - Pons 源码固定版本 `845bd546b37515621e47b08015ce4f9d374f6eca`，来源 [ponsdotdev/ponsfamily](https://github.com/ponsdotdev/ponsfamily)。
 - V4 地址来自 [Uniswap 部署清单](https://github.com/Uniswap/contracts/blob/main/deployments/4663.md)。已校验链上工厂/hook 关联、池状态和路由版本特征；未完成编译后逐字节源码匹配。
@@ -107,7 +258,7 @@ node ledger.mjs account WALLET_ADDRESS
 完整实盘还缺：可用 trace 数据源、用户独立钱包、完整交易成本估算和订单执行/对账闭环。
 Telegram 通知成功不代表这些交易环节已经完成。
 
-## 首版 Python 入口（保留）
+### 首版 Python 入口（保留）
 
 Python 3.10+，在项目目录运行：
 
@@ -135,7 +286,7 @@ python3 bot.py scan --from-block 54758191 --db data/backfill.sqlite
 本轮已读取对应地址的链上字节码；尚未独立核验源码/ABI。浏览器源码接口返回 HTTP 403。
 官网页面本次研究入口返回地区不可用；没有绕过限制。
 
-## 用户资金与退出约定
+### 用户资金与退出约定
 
 | 项目 | 当前定义 | 依据 |
 |---|---|---|
@@ -182,7 +333,7 @@ python3 bot.py scan --from-block 54758191 --db data/backfill.sqlite
 当前字段缺失是 `DATA_MISSING`；网络错误报错退出，不冒充“无行情”。
 若后续确认缺口来自数据源自身的归档边界，则该单元记 `INVALID_DECLARED_GAP/null` 并跳过，不补造数据。
 
-## 自建还是嫁接
+### 自建还是嫁接
 
 结论：**自建小型策略和资金账本，后续只复用核实过的链库/官方交易 SDK；目前不整仓嫁接。**
 这不是完全手写 EVM 编解码和签名。链上签名应交给成熟库；依赖现已获得授权并安装。
@@ -201,7 +352,7 @@ Pons V2 的曲线及毕业后 V4 hook 路径与这些旧适配器不同，不能
 链的基本参数见 [Robinhood 官方连接文档](https://docs.robinhood.com/chain/connecting/)。
 V4 的链上可用性见 [Uniswap 官方公告](https://blog.uniswap.org/robinhood-chain-is-live)。
 
-## 首轮历史验证记录
+### 首轮历史验证记录
 
 2026-09-05 首次真实扫描：区块 **54,758,191–54,759,190**，记录 **23 条事件**。
 链 ID `4663`；RPC 返回工厂代码 24,177 字节、hook 代码 15,167 字节。
@@ -217,3 +368,5 @@ V4 的链上可用性见 [Uniswap 官方公告](https://blog.uniswap.org/robinho
 3. 完成成交账本、账户净值与持续熔断，再接用户授权的交易库和独立热钱包。
 
 最大实际限制：撤池或卖出失败可以越过软件止损。将 200 放在 bot 无法使用的独立账户，才能让这部分资金不依赖 bot 的卖出成功。
+
+</details>
